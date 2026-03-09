@@ -157,6 +157,27 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 
+Session activity timeline:
+
+- Dashboard rows with an `event_stream_id` show a `View activity` action.
+- `View activity` opens a right-side drawer with recent session events.
+- The drawer supports `Human actions` (default), `Readable`, and `Raw` modes.
+- `Human actions` is a narrow high-signal feed. Current v1 action detection includes:
+  - Linear GraphQL `commentCreate`
+  - Linear GraphQL `issueUpdate`
+  - `git commit` command intent
+  - `gh pr create` command intent
+  - `thread/status/changed`
+- Human action rows support inline detail expansion in the drawer.
+- Timeline events are available via:
+  - `GET /api/v1/session/:event_stream_id/events`
+  - Optional query param: `limit` (default `200`, max `1000`)
+- Session event payloads may include optional fields for human-action rendering:
+  - `kind`
+  - `category`
+  - `action`
+  - `details`
+
 ## Project Layout
 
 - `lib/`: application code and Mix tasks

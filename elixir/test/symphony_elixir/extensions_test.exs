@@ -75,6 +75,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:session_events, event_stream_id, limit}, _from, state) do
+      session_events = Keyword.get(state, :session_events, %{})
+
+      reply =
+        case Map.get(session_events, event_stream_id) do
+          events when is_list(events) -> {:ok, Enum.take(events, -limit)}
+          _ -> {:error, :session_not_found}
+        end
+
+      {:reply, reply, state}
+    end
   end
 
   setup do
@@ -327,6 +339,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       StaticOrchestrator.start_link(
         name: orchestrator_name,
         snapshot: snapshot,
+        session_events: static_session_events(),
         refresh: %{
           queued: true,
           coalesced: false,
@@ -348,6 +361,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
                  "state" => "In Progress",
+                 "event_stream_id" => "mt-http-session",
                  "session_id" => "thread-http",
                  "turn_count" => 7,
                  "last_event" => "notification",
@@ -364,6 +378,24 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom"
+               }
+             ],
+             "inactive_sessions" => [
+               %{
+                 "issue_id" => "issue-old",
+                 "issue_identifier" => "MT-OLD",
+                 "state" => "In Review",
+                 "event_stream_id" => "mt-old-session",
+                 "session_id" => "thread-old",
+                 "turn_count" => 3,
+                 "stop_reason" => "completed",
+                 "started_at" => state_payload["inactive_sessions"] |> List.first() |> Map.fetch!("started_at"),
+                 "ended_at" => state_payload["inactive_sessions"] |> List.first() |> Map.fetch!("ended_at"),
+                 "runtime_seconds" => 90,
+                 "last_event" => "turn_completed",
+                 "last_message" => "done",
+                 "last_event_at" => state_payload["inactive_sessions"] |> List.first() |> Map.fetch!("last_event_at"),
+                 "tokens" => %{"input_tokens" => 20, "output_tokens" => 40, "total_tokens" => 60}
                }
              ],
              "codex_totals" => %{
@@ -385,6 +417,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "workspace" => %{"path" => Path.join(Config.workspace_root(), "MT-HTTP")},
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
              "running" => %{
+               "event_stream_id" => "mt-http-session",
                "session_id" => "thread-http",
                "turn_count" => 7,
                "state" => "In Progress",
@@ -412,6 +445,37 @@ defmodule SymphonyElixir.ExtensionsTest do
              "error" => %{"code" => "issue_not_found", "message" => "Issue not found"}
            }
 
+    conn = get(build_conn(), "/api/v1/session/mt-http-session/events?limit=1")
+    session_events_payload = json_response(conn, 200)
+
+    assert session_events_payload == %{
+             "event_stream_id" => "mt-http-session",
+             "events" => [
+               %{
+                 "at" => "2026-01-01T10:00:05Z",
+                 "issue_identifier" => "MT-HTTP",
+                 "session_id" => "thread-http",
+                 "turn_count" => 7,
+                 "event" => "notification",
+                 "label" => "notification",
+                 "message" => "thread/status/changed",
+                 "kind" => "human_action",
+                 "category" => "status",
+                 "action" => "thread_status_changed",
+                 "details" => %{"from" => "planning", "to" => "in_progress"}
+               }
+             ]
+           }
+
+    conn = get(build_conn(), "/api/v1/session/missing-session/events")
+
+    assert json_response(conn, 404) == %{
+             "error" => %{
+               "code" => "session_not_found",
+               "message" => "Session timeline not found"
+             }
+           }
+
     conn = post(build_conn(), "/api/v1/refresh", %{})
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
@@ -432,6 +496,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(post(build_conn(), "/api/v1/MT-1", %{}), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(post(build_conn(), "/api/v1/session/stream/events", %{}), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/unknown"), 404) ==
@@ -475,6 +542,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       StaticOrchestrator.start_link(
         name: orchestrator_name,
         snapshot: static_snapshot(),
+        session_events: static_session_events(),
         refresh: %{
           queued: true,
           coalesced: false,
@@ -495,9 +563,14 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     dashboard_css = response(get(build_conn(), "/dashboard.css"), 200)
     assert dashboard_css =~ ":root {"
-    assert dashboard_css =~ ".status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
+    assert dashboard_css =~ "\"Roboto Mono\""
+    assert dashboard_css =~ "/fonts/roboto-mono-400.ttf"
+    assert dashboard_css =~ ".status-inline-live"
+    assert dashboard_css =~ "[data-phx-main].phx-connected .status-inline-live"
+    assert dashboard_css =~ "[data-phx-main].phx-connected .status-inline-offline"
+
+    roboto_font = response(get(build_conn(), "/fonts/roboto-mono-400.ttf"), 200)
+    assert byte_size(roboto_font) > 10_000
 
     phoenix_html_js = response(get(build_conn(), "/vendor/phoenix_html/phoenix_html.js"), 200)
     assert phoenix_html_js =~ "phoenix.link.click"
@@ -519,6 +592,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       StaticOrchestrator.start_link(
         name: orchestrator_name,
         snapshot: snapshot,
+        session_events: static_session_events(),
         refresh: %{
           queued: true,
           coalesced: true,
@@ -530,7 +604,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
@@ -538,13 +611,85 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
+    assert html =~ "Activity"
     assert html =~ "Codex update"
+    assert html =~ "Inactive sessions"
+    assert html =~ "MT-OLD"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
     refute html =~ "Transport"
-    assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
+    assert html =~ "status-inline-live"
+    assert html =~ "status-inline-offline"
+
+    view
+    |> element("button[phx-click='open_activity'][phx-value-stream_id='mt-http-session']")
+    |> render_click()
+
+    assert render(view) =~ "Session activity"
+    assert render(view) =~ "mt-http-session"
+    assert render(view) =~ "Human actions"
+    assert render(view) =~ "Readable"
+    assert render(view) =~ "Raw"
+    assert render(view) =~ "Status Changed"
+    assert render(view) =~ "thread/status/changed"
+
+    refute render(view) =~ "agent message content streaming: rendered"
+
+    view
+    |> element("button[phx-click='toggle_activity_detail']")
+    |> render_click()
+
+    assert render(view) =~ "planning"
+    assert render(view) =~ "in_progress"
+
+    view
+    |> element("button[phx-click='set_activity_mode'][phx-value-mode='readable']")
+    |> render_click()
+
+    assert render(view) =~ "Agent Message"
+    assert render(view) =~ "rendered"
+
+    view
+    |> element("button[phx-click='set_activity_mode'][phx-value-mode='raw']")
+    |> render_click()
+
+    assert render(view) =~ "agent message content streaming: rendered"
+
+    view
+    |> element("button[phx-click='set_activity_mode'][phx-value-mode='human']")
+    |> render_click()
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      session_events = Keyword.get(state, :session_events, %{})
+
+      refreshed_events = [
+        %{
+          at: "2026-01-01T10:00:06Z",
+          issue_identifier: "MT-HTTP",
+          session_id: "thread-http",
+          turn_count: 8,
+          event: "notification",
+          label: "notification",
+          message: "agent message content streaming: refresh only"
+        }
+      ]
+
+      Keyword.put(state, :session_events, Map.put(session_events, "mt-http-session", refreshed_events))
+    end)
+
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      html = render(view)
+      html =~ "Status Changed" and html =~ "thread/status/changed"
+    end)
+
+    view
+    |> element("button.secondary[phx-click='close_activity']")
+    |> render_click()
+
+    refute render(view) =~ "Session activity drawer"
 
     updated_snapshot =
       put_in(snapshot.running, [
@@ -552,6 +697,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_id: "issue-http",
           identifier: "MT-HTTP",
           state: "In Progress",
+          event_stream_id: "mt-http-session",
           session_id: "thread-http",
           turn_count: 8,
           last_codex_event: :notification,
@@ -583,7 +729,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      render(view) =~ "structured update"
     end)
   end
 
@@ -623,7 +769,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       snapshot_timeout_ms: 50
     ]
 
-    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh})
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, session_events: static_session_events(), refresh: refresh})
 
     start_supervised!({HttpServer, server_opts})
 
@@ -681,6 +827,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_id: "issue-http",
           identifier: "MT-HTTP",
           state: "In Progress",
+          event_stream_id: "mt-http-session",
           session_id: "thread-http",
           turn_count: 7,
           codex_app_server_pid: nil,
@@ -702,8 +849,77 @@ defmodule SymphonyElixir.ExtensionsTest do
           error: "boom"
         }
       ],
+      inactive_sessions: [
+        %{
+          issue_id: "issue-old",
+          identifier: "MT-OLD",
+          state: "In Review",
+          event_stream_id: "mt-old-session",
+          session_id: "thread-old",
+          turn_count: 3,
+          stop_reason: "completed",
+          started_at: DateTime.add(DateTime.utc_now(), -90, :second),
+          ended_at: DateTime.utc_now(),
+          runtime_seconds: 90,
+          last_codex_event: :turn_completed,
+          last_codex_message: "done",
+          last_codex_timestamp: DateTime.utc_now(),
+          codex_input_tokens: 20,
+          codex_output_tokens: 40,
+          codex_total_tokens: 60
+        }
+      ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
+    }
+  end
+
+  defp static_session_events do
+    %{
+      "mt-http-session" => [
+        %{
+          at: "2026-01-01T10:00:01Z",
+          issue_identifier: "MT-HTTP",
+          session_id: "thread-http",
+          turn_count: 7,
+          event: "session_started",
+          label: "session started",
+          message: "session started"
+        },
+        %{
+          at: "2026-01-01T10:00:04Z",
+          issue_identifier: "MT-HTTP",
+          session_id: "thread-http",
+          turn_count: 7,
+          event: "notification",
+          label: "notification",
+          message: "agent message content streaming: rendered"
+        },
+        %{
+          at: "2026-01-01T10:00:05Z",
+          issue_identifier: "MT-HTTP",
+          session_id: "thread-http",
+          turn_count: 7,
+          event: "notification",
+          label: "notification",
+          message: "thread/status/changed",
+          kind: "human_action",
+          category: "status",
+          action: "thread_status_changed",
+          details: %{"from" => "planning", "to" => "in_progress"}
+        }
+      ],
+      "mt-old-session" => [
+        %{
+          at: "2026-01-01T09:59:00Z",
+          issue_identifier: "MT-OLD",
+          session_id: "thread-old",
+          turn_count: 3,
+          event: "turn_completed",
+          label: "turn completed",
+          message: "done"
+        }
+      ]
     }
   end
 

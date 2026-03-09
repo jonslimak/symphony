@@ -7,11 +7,15 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, SessionTimelineStore, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @inactive_sessions_limit 50
+  @timeline_events_limit 200
+  @timeline_retention_seconds 14 * 24 * 60 * 60
+  @timeline_cleanup_interval_ms 60 * 60 * 1_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -32,6 +36,9 @@ defmodule SymphonyElixir.Orchestrator do
       :next_poll_due_at_ms,
       :poll_check_in_progress,
       running: %{},
+      timeline_events: %{},
+      timeline_last_cleanup_ms: nil,
+      inactive_sessions: [],
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
@@ -56,10 +63,13 @@ defmodule SymphonyElixir.Orchestrator do
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
       codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      timeline_events: %{},
+      timeline_last_cleanup_ms: nil
     }
 
     run_terminal_workspace_cleanup()
+    state = maybe_cleanup_timeline_files(state, true)
     :ok = schedule_tick(0)
 
     {:ok, state}
@@ -68,6 +78,7 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_info(:tick, state) do
     state = refresh_runtime_config(state)
+    state = maybe_cleanup_timeline_files(state)
     state = %{state | poll_check_in_progress: true, next_poll_due_at_ms: nil}
 
     notify_dashboard()
@@ -98,7 +109,12 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
+
+        state =
+          state
+          |> record_session_completion_totals(running_entry)
+          |> record_inactive_session(running_entry, down_stop_reason(reason))
+
         session_id = running_entry_session_id(running_entry)
 
         state =
@@ -146,6 +162,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> append_timeline_event(updated_running_entry, update)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -303,12 +320,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        terminate_running_issue(state, issue.id, true, "terminal_state")
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, "no_longer_routed")
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -316,7 +333,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, "non_active_state")
     end
   end
 
@@ -332,13 +349,16 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, stop_reason) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
+        state =
+          state
+          |> record_session_completion_totals(running_entry)
+          |> record_inactive_session(running_entry, stop_reason)
 
         if cleanup_workspace do
           cleanup_issue_workspace(identifier)
@@ -358,6 +378,7 @@ defmodule SymphonyElixir.Orchestrator do
             claimed: MapSet.delete(state.claimed, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id)
         }
+        |> prune_timeline_events()
 
       _ ->
         release_issue_claim(state, issue_id)
@@ -395,7 +416,7 @@ defmodule SymphonyElixir.Orchestrator do
       next_attempt = next_retry_attempt_from_running(running_entry)
 
       state
-      |> terminate_running_issue(issue_id, false)
+      |> terminate_running_issue(issue_id, false, "stalled_restart")
       |> schedule_issue_retry(issue_id, next_attempt, %{
         identifier: identifier,
         error: "stalled for #{elapsed_ms}ms without codex activity"
@@ -597,6 +618,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp do_dispatch_issue(%State{} = state, issue, attempt) do
     recipient = self()
+    event_stream_id = build_event_stream_id(issue)
 
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt)
@@ -612,6 +634,7 @@ defmodule SymphonyElixir.Orchestrator do
             ref: ref,
             identifier: issue.identifier,
             issue: issue,
+            event_stream_id: event_stream_id,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -631,6 +654,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           state
           | running: running,
+            timeline_events: Map.put_new(state.timeline_events, event_stream_id, []),
             claimed: MapSet.put(state.claimed, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
@@ -913,6 +937,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec session_events(String.t(), pos_integer()) ::
+          {:ok, [map()]} | {:error, :session_not_found} | :timeout | :unavailable
+  def session_events(event_stream_id, limit \\ 200) when is_binary(event_stream_id) do
+    session_events(__MODULE__, event_stream_id, limit, 15_000)
+  end
+
+  @spec session_events(GenServer.server(), String.t(), pos_integer(), timeout()) ::
+          {:ok, [map()]} | {:error, :session_not_found} | :timeout | :unavailable
+  def session_events(server, event_stream_id, limit, timeout)
+      when is_binary(event_stream_id) and is_integer(limit) and limit > 0 do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:session_events, event_stream_id, normalize_session_event_limit(limit)}, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -926,6 +972,7 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: issue_id,
           identifier: metadata.identifier,
           state: metadata.issue.state,
+          event_stream_id: Map.get(metadata, :event_stream_id),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
@@ -955,6 +1002,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply,
      %{
        running: running,
+       inactive_sessions: state.inactive_sessions,
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
@@ -982,6 +1030,13 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call({:session_events, event_stream_id, limit}, _from, state) do
+    case session_events_from_state(state, event_stream_id, limit) do
+      {:ok, events} -> {:reply, {:ok, events}, state}
+      {:error, :session_not_found} -> {:reply, {:error, :session_not_found}, state}
+    end
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
@@ -1058,6 +1113,618 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp append_timeline_event(%State{} = state, running_entry, %{event: _, timestamp: _} = update)
+       when is_map(running_entry) do
+    case Map.get(running_entry, :event_stream_id) do
+      stream_id when is_binary(stream_id) ->
+        event = timeline_event_payload(running_entry, update)
+
+        state =
+          Map.update(state, :timeline_events, %{stream_id => [event]}, fn existing ->
+            Map.update(existing, stream_id, [event], fn events ->
+              (events ++ [event]) |> Enum.take(-@timeline_events_limit)
+            end)
+          end)
+
+        case SessionTimelineStore.append(stream_id, event) do
+          :ok ->
+            state
+
+          {:error, reason} ->
+            Logger.warning("Failed to append session timeline event stream=#{stream_id} issue_identifier=#{Map.get(running_entry, :identifier)}: #{inspect(reason)}")
+
+            state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp append_timeline_event(state, _running_entry, _update), do: state
+
+  defp timeline_event_payload(running_entry, update) do
+    event_name = update[:event] |> to_string()
+    classification = classify_human_timeline_event(update)
+
+    message =
+      update
+      |> summarize_codex_update()
+      |> StatusDashboard.humanize_codex_message()
+      |> sanitize_timeline_message()
+
+    %{
+      at: timeline_timestamp(update[:timestamp]),
+      issue_identifier: Map.get(running_entry, :identifier),
+      session_id: Map.get(running_entry, :session_id),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      event: event_name,
+      label: String.replace(event_name, "_", " "),
+      message: message
+    }
+    |> maybe_put_timeline_field(:kind, Map.get(classification, :kind))
+    |> maybe_put_timeline_field(:category, Map.get(classification, :category))
+    |> maybe_put_timeline_field(:action, Map.get(classification, :action))
+    |> maybe_put_timeline_field(:details, sanitize_timeline_details(Map.get(classification, :details)))
+  end
+
+  defp timeline_timestamp(%DateTime{} = timestamp),
+    do: timestamp |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+  defp timeline_timestamp(_timestamp), do: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+  defp sanitize_timeline_message(message) when is_binary(message) do
+    message
+    |> String.trim()
+    |> redact_sensitive_tokens()
+    |> String.slice(0, 300)
+  end
+
+  defp sanitize_timeline_message(message), do: message |> to_string() |> sanitize_timeline_message()
+
+  defp redact_sensitive_tokens(message) when is_binary(message) do
+    [
+      ~r/lin_api_[A-Za-z0-9]+/,
+      ~r/sk-[A-Za-z0-9_-]{16,}/,
+      ~r/(ghp_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{20,})/,
+      ~r/(xox[baprs]-[A-Za-z0-9-]{10,})/,
+      ~r/((api[_-]?key|authorization|token|password|secret)\s*[:=]\s*)[^\s,;]+/i
+    ]
+    |> Enum.reduce(message, fn pattern, acc ->
+      Regex.replace(pattern, acc, "[REDACTED]")
+    end)
+  end
+
+  defp classify_human_timeline_event(update) when is_map(update) do
+    payload = codex_update_payload(update)
+    event = Map.get(update, :event)
+    method = codex_method(payload)
+
+    cond do
+      event == :tool_call_completed and method == "item/tool/call" ->
+        classify_linear_tool_call(payload)
+
+      method in ["codex/event/exec_command_begin", "item/commandExecution/requestApproval"] ->
+        classify_command_event(payload)
+
+      method == "thread/status/changed" ->
+        classify_thread_status_change(payload)
+
+      true ->
+        %{}
+    end
+  end
+
+  defp classify_human_timeline_event(_update), do: %{}
+
+  defp codex_update_payload(%{} = update) do
+    case Map.get(update, :payload) do
+      %{} = payload ->
+        payload
+
+      _ ->
+        case Map.get(update, :raw) do
+          raw when is_binary(raw) ->
+            case Jason.decode(raw) do
+              {:ok, %{} = payload} -> payload
+              _ -> %{}
+            end
+
+          _ ->
+            %{}
+        end
+    end
+  end
+
+  defp codex_method(payload) when is_map(payload) do
+    map_lookup_any(payload, [["method"], [:method]])
+  end
+
+  defp codex_method(_payload), do: nil
+
+  defp classify_linear_tool_call(payload) when is_map(payload) do
+    tool_name =
+      map_lookup(payload, ["params", "tool"]) ||
+        map_lookup(payload, ["params", :tool]) ||
+        map_lookup(payload, ["params", "name"]) ||
+        map_lookup(payload, ["params", :name])
+
+    arguments =
+      map_lookup(payload, ["params", "arguments"]) || map_lookup(payload, ["params", :arguments])
+
+    with "linear_graphql" <- normalize_string(tool_name),
+         %{} = normalized_args <- normalize_linear_tool_arguments(arguments),
+         query when is_binary(query) <- map_lookup_any(normalized_args, [["query"], [:query]]) do
+      case linear_operation_from_query(query) do
+        :comment_create ->
+          %{
+            kind: "human_action",
+            category: "linear",
+            action: "linear_comment_create",
+            details:
+              %{
+                operation: "commentCreate",
+                issue_id: extract_linear_issue_id(normalized_args)
+              }
+              |> compact_timeline_details()
+          }
+
+        :issue_update ->
+          %{
+            kind: "human_action",
+            category: "linear",
+            action: "linear_status_change",
+            details:
+              %{
+                operation: "issueUpdate",
+                issue_id: extract_linear_issue_id(normalized_args),
+                state_id: extract_linear_state_id(normalized_args)
+              }
+              |> compact_timeline_details()
+          }
+
+        :unknown ->
+          %{}
+      end
+    else
+      _ -> %{}
+    end
+  end
+
+  defp classify_linear_tool_call(_payload), do: %{}
+
+  defp normalize_linear_tool_arguments(arguments) when is_map(arguments), do: arguments
+
+  defp normalize_linear_tool_arguments(arguments) when is_binary(arguments) do
+    case Jason.decode(arguments) do
+      {:ok, %{} = decoded} -> decoded
+      _ -> %{}
+    end
+  end
+
+  defp normalize_linear_tool_arguments(_arguments), do: %{}
+
+  defp linear_operation_from_query(query) when is_binary(query) do
+    cond do
+      Regex.match?(~r/\bcommentCreate\b/, query) -> :comment_create
+      Regex.match?(~r/\bissueUpdate\b/, query) -> :issue_update
+      true -> :unknown
+    end
+  end
+
+  defp linear_operation_from_query(_query), do: :unknown
+
+  defp extract_linear_issue_id(arguments) when is_map(arguments) do
+    variables =
+      map_lookup_any(arguments, [["variables"], [:variables]])
+
+    input =
+      map_lookup_any(variables || %{}, [["input"], [:input]])
+
+    first_present([
+      map_lookup_any(variables || %{}, [["issueId"], [:issueId]]),
+      map_lookup_any(variables || %{}, [["issue_id"], [:issue_id]]),
+      map_lookup_any(variables || %{}, [["id"], [:id]]),
+      map_lookup_any(input || %{}, [["issueId"], [:issueId]]),
+      map_lookup_any(input || %{}, [["id"], [:id]]),
+      map_lookup_any(arguments, [["issueId"], [:issueId]]),
+      map_lookup_any(arguments, [["id"], [:id]])
+    ])
+  end
+
+  defp extract_linear_issue_id(_arguments), do: nil
+
+  defp extract_linear_state_id(arguments) when is_map(arguments) do
+    variables =
+      map_lookup_any(arguments, [["variables"], [:variables]])
+
+    input =
+      map_lookup_any(variables || %{}, [["input"], [:input]])
+
+    first_present([
+      map_lookup_any(variables || %{}, [["stateId"], [:stateId]]),
+      map_lookup_any(variables || %{}, [["state_id"], [:state_id]]),
+      map_lookup_any(input || %{}, [["stateId"], [:stateId]]),
+      map_lookup_any(input || %{}, [["state_id"], [:state_id]]),
+      map_lookup_any(arguments, [["stateId"], [:stateId]])
+    ])
+  end
+
+  defp extract_linear_state_id(_arguments), do: nil
+
+  defp classify_command_event(payload) when is_map(payload) do
+    command = extract_timeline_command(payload)
+    command_target = normalize_command_target(command)
+    exit_code = extract_timeline_exit_code(payload)
+
+    cond do
+      command_target == nil ->
+        %{}
+
+      String.starts_with?(command_target, "git commit") ->
+        %{
+          kind: "human_action",
+          category: "git",
+          action: "git_commit",
+          details:
+            %{
+              command: command,
+              exit_code: exit_code
+            }
+            |> compact_timeline_details()
+        }
+
+      String.starts_with?(command_target, "gh pr create") ->
+        %{
+          kind: "human_action",
+          category: "git",
+          action: "github_pr_create",
+          details:
+            %{
+              command: command,
+              exit_code: exit_code
+            }
+            |> compact_timeline_details()
+        }
+
+      true ->
+        %{}
+    end
+  end
+
+  defp classify_command_event(_payload), do: %{}
+
+  defp classify_thread_status_change(payload) when is_map(payload) do
+    %{
+      kind: "human_action",
+      category: "status",
+      action: "thread_status_changed",
+      details:
+        %{
+          from: extract_status_value(payload, :from),
+          to: extract_status_value(payload, :to)
+        }
+        |> compact_timeline_details()
+    }
+  end
+
+  defp classify_thread_status_change(_payload), do: %{}
+
+  defp extract_status_value(payload, :from) do
+    first_present([
+      map_lookup(payload, ["params", "from"]),
+      map_lookup(payload, ["params", :from]),
+      map_lookup(payload, ["params", "oldStatus"]),
+      map_lookup(payload, ["params", :oldStatus]),
+      map_lookup(payload, ["params", "previousStatus"]),
+      map_lookup(payload, ["params", :previousStatus]),
+      map_lookup(payload, ["params", "status", "from"])
+    ])
+  end
+
+  defp extract_status_value(payload, :to) do
+    first_present([
+      map_lookup(payload, ["params", "to"]),
+      map_lookup(payload, ["params", :to]),
+      map_lookup(payload, ["params", "newStatus"]),
+      map_lookup(payload, ["params", :newStatus]),
+      map_lookup(payload, ["params", "currentStatus"]),
+      map_lookup(payload, ["params", :currentStatus]),
+      map_lookup(payload, ["params", "status", "to"])
+    ])
+  end
+
+  defp extract_timeline_command(payload) do
+    first_present([
+      map_lookup(payload, ["params", "msg", "command"]),
+      map_lookup(payload, ["params", :msg, :command]),
+      map_lookup(payload, ["params", "msg", "parsed_cmd"]),
+      map_lookup(payload, ["params", :msg, :parsed_cmd]),
+      map_lookup(payload, ["params", "parsedCmd"]),
+      map_lookup(payload, ["params", :parsedCmd]),
+      map_lookup(payload, ["params", "command"]),
+      map_lookup(payload, ["params", :command])
+    ])
+    |> normalize_string()
+  end
+
+  defp extract_timeline_exit_code(payload) do
+    first_present([
+      map_lookup(payload, ["params", "msg", "exit_code"]),
+      map_lookup(payload, ["params", :msg, :exit_code]),
+      map_lookup(payload, ["params", "msg", "exitCode"]),
+      map_lookup(payload, ["params", :msg, :exitCode]),
+      map_lookup(payload, ["params", "exit_code"]),
+      map_lookup(payload, ["params", :exit_code])
+    ])
+  end
+
+  defp normalize_command_target(command) when is_binary(command) do
+    target =
+      case Regex.run(~r/\s-lc\s+(.+)$/, command, capture: :all_but_first) do
+        [shell_command] -> shell_command
+        _ -> command
+      end
+      |> String.trim()
+      |> strip_matching_quotes()
+      |> String.trim()
+      |> String.downcase()
+
+    if target == "", do: nil, else: target
+  end
+
+  defp normalize_command_target(_command), do: nil
+
+  defp strip_matching_quotes(<<"\"", rest::binary>>) do
+    if String.ends_with?(rest, "\""), do: String.trim_trailing(rest, "\""), else: "\"" <> rest
+  end
+
+  defp strip_matching_quotes(<<"'", rest::binary>>) do
+    if String.ends_with?(rest, "'"), do: String.trim_trailing(rest, "'"), else: "'" <> rest
+  end
+
+  defp strip_matching_quotes(value), do: value
+
+  defp compact_timeline_details(details) when is_map(details) do
+    details
+    |> Enum.reduce(%{}, fn
+      {_key, nil}, acc -> acc
+      {key, value}, acc -> Map.put(acc, key, value)
+    end)
+    |> case do
+      map when map_size(map) == 0 -> nil
+      map -> map
+    end
+  end
+
+  defp compact_timeline_details(_details), do: nil
+
+  defp sanitize_timeline_details(nil), do: nil
+
+  defp sanitize_timeline_details(details) when is_map(details) do
+    sanitized =
+      details
+      |> Enum.reduce(%{}, fn {key, value}, acc ->
+        case sanitize_timeline_detail_value(value) do
+          nil -> acc
+          sanitized_value -> Map.put(acc, to_string(key), sanitized_value)
+        end
+      end)
+
+    if map_size(sanitized) == 0, do: nil, else: sanitized
+  end
+
+  defp sanitize_timeline_details(_details), do: nil
+
+  defp sanitize_timeline_detail_value(nil), do: nil
+
+  defp sanitize_timeline_detail_value(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> redact_sensitive_tokens()
+    |> String.slice(0, 240)
+  end
+
+  defp sanitize_timeline_detail_value(value) when is_map(value), do: sanitize_timeline_details(value)
+
+  defp sanitize_timeline_detail_value(value) when is_list(value) do
+    sanitized =
+      value
+      |> Enum.map(&sanitize_timeline_detail_value/1)
+      |> Enum.reject(&is_nil/1)
+
+    if sanitized == [], do: nil, else: sanitized
+  end
+
+  defp sanitize_timeline_detail_value(value)
+       when is_integer(value) or is_float(value) or is_boolean(value),
+       do: value
+
+  defp sanitize_timeline_detail_value(value) do
+    value
+    |> to_string()
+    |> sanitize_timeline_detail_value()
+  end
+
+  defp maybe_put_timeline_field(map, _key, nil), do: map
+  defp maybe_put_timeline_field(map, key, value), do: Map.put(map, key, value)
+
+  defp map_lookup(map, path) when is_map(map) and is_list(path) do
+    Enum.reduce_while(path, map, fn segment, acc ->
+      case acc do
+        current when is_map(current) ->
+          case Map.fetch(current, segment) do
+            {:ok, next} -> {:cont, next}
+            :error -> {:halt, nil}
+          end
+
+        _ ->
+          {:halt, nil}
+      end
+    end)
+  end
+
+  defp map_lookup(_map, _path), do: nil
+
+  defp map_lookup_any(map, paths) when is_map(map) and is_list(paths) do
+    Enum.find_value(paths, fn path -> map_lookup(map, path) end)
+  end
+
+  defp map_lookup_any(_map, _paths), do: nil
+
+  defp first_present(values) when is_list(values) do
+    Enum.find(values, fn value ->
+      case value do
+        nil -> false
+        "" -> false
+        _ -> true
+      end
+    end)
+  end
+
+  defp normalize_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_string(value), do: value
+
+  defp session_events_from_state(%State{} = state, event_stream_id, limit)
+       when is_binary(event_stream_id) and is_integer(limit) and limit > 0 do
+    in_memory = state.timeline_events |> Map.get(event_stream_id, []) |> Enum.take(-limit)
+    persisted = read_session_events_from_store(event_stream_id, limit)
+
+    cond do
+      persisted != nil and persisted != [] ->
+        {:ok, merge_session_events(persisted, in_memory, limit)}
+
+      in_memory != [] ->
+        {:ok, in_memory}
+
+      known_event_stream_id?(state, event_stream_id) ->
+        {:ok, []}
+
+      true ->
+        {:error, :session_not_found}
+    end
+  end
+
+  defp session_events_from_state(_state, _event_stream_id, _limit), do: {:error, :session_not_found}
+
+  defp read_session_events_from_store(event_stream_id, limit) do
+    case SessionTimelineStore.read(event_stream_id, limit) do
+      {:ok, events} when is_list(events) -> events
+      _ -> nil
+    end
+  end
+
+  defp merge_session_events(persisted, in_memory, limit)
+       when is_list(persisted) and is_list(in_memory) and is_integer(limit) and limit > 0 do
+    (persisted ++ in_memory)
+    |> Enum.reduce({MapSet.new(), []}, fn event, {seen, acc} ->
+      key = session_event_dedupe_key(event)
+
+      if MapSet.member?(seen, key) do
+        {seen, acc}
+      else
+        {MapSet.put(seen, key), [event | acc]}
+      end
+    end)
+    |> elem(1)
+    |> Enum.reverse()
+    |> Enum.take(-limit)
+  end
+
+  defp merge_session_events(_persisted, in_memory, _limit) when is_list(in_memory), do: in_memory
+
+  defp session_event_dedupe_key(%{} = event) do
+    [
+      Map.get(event, :at) || Map.get(event, "at"),
+      Map.get(event, :event) || Map.get(event, "event"),
+      Map.get(event, :session_id) || Map.get(event, "session_id"),
+      Map.get(event, :turn_count) || Map.get(event, "turn_count"),
+      Map.get(event, :message) || Map.get(event, "message")
+    ]
+  end
+
+  defp session_event_dedupe_key(event), do: event
+
+  defp known_event_stream_id?(%State{} = state, event_stream_id) when is_binary(event_stream_id) do
+    running_ids =
+      state.running
+      |> Map.values()
+      |> Enum.map(&Map.get(&1, :event_stream_id))
+      |> Enum.reject(&is_nil/1)
+
+    inactive_ids =
+      state.inactive_sessions
+      |> Enum.map(&Map.get(&1, :event_stream_id))
+      |> Enum.reject(&is_nil/1)
+
+    Enum.any?(running_ids ++ inactive_ids, &(&1 == event_stream_id)) or
+      SessionTimelineStore.exists?(event_stream_id)
+  end
+
+  defp known_event_stream_id?(_state, _event_stream_id), do: false
+
+  defp prune_timeline_events(%State{} = state) do
+    keep_ids =
+      state.running
+      |> Map.values()
+      |> Enum.map(&Map.get(&1, :event_stream_id))
+      |> Kernel.++(Enum.map(state.inactive_sessions, &Map.get(&1, :event_stream_id)))
+      |> Enum.reject(&is_nil/1)
+      |> MapSet.new()
+
+    timeline_events =
+      state.timeline_events
+      |> Enum.filter(fn {stream_id, _events} -> MapSet.member?(keep_ids, stream_id) end)
+      |> Map.new()
+
+    %{state | timeline_events: timeline_events}
+  end
+
+  defp maybe_cleanup_timeline_files(%State{} = state, force \\ false) do
+    now_ms = System.monotonic_time(:millisecond)
+    last_cleanup_ms = Map.get(state, :timeline_last_cleanup_ms)
+
+    should_cleanup? =
+      force or is_nil(last_cleanup_ms) or now_ms - last_cleanup_ms >= @timeline_cleanup_interval_ms
+
+    if should_cleanup? do
+      case SessionTimelineStore.cleanup_expired(@timeline_retention_seconds) do
+        {:ok, _removed_count} ->
+          %{state | timeline_last_cleanup_ms: now_ms}
+
+        {:error, reason} ->
+          Logger.warning("Failed session timeline retention cleanup: #{inspect(reason)}")
+          %{state | timeline_last_cleanup_ms: now_ms}
+      end
+    else
+      state
+    end
+  end
+
+  defp build_event_stream_id(%Issue{} = issue) do
+    base =
+      issue.identifier
+      |> to_string()
+      |> String.trim()
+      |> String.replace(~r/[^A-Za-z0-9_-]/, "-")
+      |> case do
+        "" -> "issue"
+        value -> String.downcase(value)
+      end
+
+    unique_suffix = System.unique_integer([:positive, :monotonic]) |> Integer.to_string(36)
+    "#{base}-#{unique_suffix}"
+  end
+
+  defp normalize_session_event_limit(limit) when is_integer(limit) and limit > 0, do: min(limit, 10_000)
+  defp normalize_session_event_limit(_limit), do: 200
+
   defp schedule_tick(delay_ms) do
     :timer.send_after(delay_ms, self(), :tick)
     :ok
@@ -1077,6 +1744,46 @@ defmodule SymphonyElixir.Orchestrator do
   defp pop_running_entry(state, issue_id) do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
   end
+
+  defp down_stop_reason(:normal), do: "completed"
+  defp down_stop_reason(reason), do: "exited: #{inspect(reason)}"
+
+  defp record_inactive_session(%State{} = state, running_entry, stop_reason)
+       when is_map(running_entry) and is_binary(stop_reason) do
+    ended_at = DateTime.utc_now()
+    issue = Map.get(running_entry, :issue, %{})
+
+    entry = %{
+      issue_id: map_value(issue, :id),
+      identifier: Map.get(running_entry, :identifier),
+      state: map_value(issue, :state),
+      event_stream_id: Map.get(running_entry, :event_stream_id),
+      session_id: Map.get(running_entry, :session_id),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      started_at: Map.get(running_entry, :started_at),
+      ended_at: ended_at,
+      stop_reason: stop_reason,
+      runtime_seconds: running_seconds(Map.get(running_entry, :started_at), ended_at),
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      last_codex_message: Map.get(running_entry, :last_codex_message),
+      last_codex_event: Map.get(running_entry, :last_codex_event),
+      codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0)
+    }
+
+    inactive_sessions =
+      [entry | state.inactive_sessions]
+      |> Enum.take(@inactive_sessions_limit)
+
+    %{state | inactive_sessions: inactive_sessions}
+    |> prune_timeline_events()
+  end
+
+  defp record_inactive_session(state, _running_entry, _stop_reason), do: state
+
+  defp map_value(map, key) when is_map(map), do: Map.get(map, key)
+  defp map_value(_map, _key), do: nil
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())

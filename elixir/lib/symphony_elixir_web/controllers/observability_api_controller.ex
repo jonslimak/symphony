@@ -24,6 +24,24 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec session_events(Conn.t(), map()) :: Conn.t()
+  def session_events(conn, %{"event_stream_id" => event_stream_id} = params) do
+    limit = parse_event_limit(Map.get(params, "limit"))
+
+    case Presenter.session_events_payload(
+           event_stream_id,
+           limit,
+           orchestrator(),
+           snapshot_timeout_ms()
+         ) do
+      {:ok, payload} ->
+        json(conn, payload)
+
+      {:error, :session_not_found} ->
+        error_response(conn, 404, "session_not_found", "Session timeline not found")
+    end
+  end
+
   @spec refresh(Conn.t(), map()) :: Conn.t()
   def refresh(conn, _params) do
     case Presenter.refresh_payload(orchestrator()) do
@@ -60,4 +78,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   defp snapshot_timeout_ms do
     Endpoint.config(:snapshot_timeout_ms) || 15_000
   end
+
+  defp parse_event_limit(limit) when is_integer(limit) and limit > 0, do: min(limit, 10_000)
+
+  defp parse_event_limit(limit) when is_binary(limit) do
+    case Integer.parse(String.trim(limit)) do
+      {value, _rest} when value > 0 -> min(value, 10_000)
+      _ -> 200
+    end
+  end
+
+  defp parse_event_limit(_limit), do: 200
 end

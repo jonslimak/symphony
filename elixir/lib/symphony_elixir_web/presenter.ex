@@ -18,6 +18,10 @@ defmodule SymphonyElixirWeb.Presenter do
             retrying: length(snapshot.retrying)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
+          inactive_sessions:
+            snapshot
+            |> Map.get(:inactive_sessions, [])
+            |> Enum.map(&inactive_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
@@ -57,6 +61,26 @@ defmodule SymphonyElixirWeb.Presenter do
 
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
+    end
+  end
+
+  @spec session_events_payload(String.t(), pos_integer(), GenServer.name(), timeout()) ::
+          {:ok, map()} | {:error, :session_not_found}
+  def session_events_payload(event_stream_id, limit, orchestrator, snapshot_timeout_ms)
+      when is_binary(event_stream_id) and is_integer(limit) and limit > 0 do
+    case Orchestrator.session_events(orchestrator, event_stream_id, limit, snapshot_timeout_ms) do
+      {:ok, events} ->
+        {:ok,
+         %{
+           event_stream_id: event_stream_id,
+           events: Enum.map(events, &session_event_payload/1)
+         }}
+
+      {:error, :session_not_found} ->
+        {:error, :session_not_found}
+
+      _ ->
+        {:error, :session_not_found}
     end
   end
 
@@ -111,6 +135,7 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: entry.codex_total_tokens
       }
     }
+    |> maybe_put(:event_stream_id, Map.get(entry, :event_stream_id))
   end
 
   defp retry_entry_payload(entry) do
@@ -121,6 +146,29 @@ defmodule SymphonyElixirWeb.Presenter do
       due_at: due_at_iso8601(entry.due_in_ms),
       error: entry.error
     }
+  end
+
+  defp inactive_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      state: entry.state,
+      session_id: entry.session_id,
+      turn_count: Map.get(entry, :turn_count, 0),
+      stop_reason: entry.stop_reason,
+      started_at: iso8601(entry.started_at),
+      ended_at: iso8601(entry.ended_at),
+      runtime_seconds: Map.get(entry, :runtime_seconds, 0),
+      last_event: entry.last_codex_event,
+      last_message: summarize_message(entry.last_codex_message),
+      last_event_at: iso8601(entry.last_codex_timestamp),
+      tokens: %{
+        input_tokens: entry.codex_input_tokens,
+        output_tokens: entry.codex_output_tokens,
+        total_tokens: entry.codex_total_tokens
+      }
+    }
+    |> maybe_put(:event_stream_id, Map.get(entry, :event_stream_id))
   end
 
   defp running_issue_payload(running) do
@@ -138,6 +186,7 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: running.codex_total_tokens
       }
     }
+    |> maybe_put(:event_stream_id, Map.get(running, :event_stream_id))
   end
 
   defp retry_issue_payload(retry) do
@@ -162,6 +211,24 @@ defmodule SymphonyElixirWeb.Presenter do
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
 
+  defp session_event_payload(event) when is_map(event) do
+    %{
+      at: event_value(event, :at),
+      issue_identifier: event_value(event, :issue_identifier),
+      session_id: event_value(event, :session_id),
+      turn_count: event_value(event, :turn_count),
+      event: event_value(event, :event),
+      label: event_value(event, :label),
+      message: event_value(event, :message)
+    }
+    |> maybe_put(:kind, event_value(event, :kind))
+    |> maybe_put(:category, event_value(event, :category))
+    |> maybe_put(:action, event_value(event, :action))
+    |> maybe_put(:details, event_value(event, :details))
+  end
+
+  defp session_event_payload(_event), do: %{}
+
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()
     |> DateTime.add(div(due_in_ms, 1_000), :second)
@@ -178,4 +245,11 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp event_value(event, key) when is_map(event) do
+    Map.get(event, key) || Map.get(event, Atom.to_string(key))
+  end
 end

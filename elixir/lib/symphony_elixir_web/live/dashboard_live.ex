@@ -5,8 +5,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
-  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter, SessionActivityFormatter}
   @runtime_tick_ms 1_000
+  @session_events_limit 10_000
+  @session_human_ledger_limit 5_000
 
   @impl true
   def mount(_params, _session, socket) do
@@ -14,6 +16,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
       socket
       |> assign(:payload, load_payload())
       |> assign(:now, DateTime.utc_now())
+      |> assign(:activity_drawer_open, false)
+      |> assign(:activity_mode, "human")
+      |> assign(:activity_stream_id, nil)
+      |> assign(:activity_issue_identifier, nil)
+      |> assign(:activity_events_raw, [])
+      |> assign(:activity_events_readable, [])
+      |> assign(:activity_events_human, [])
+      |> assign(:activity_human_ledger, %{})
+      |> assign(:activity_expanded_keys, MapSet.new())
+      |> assign(:activity_error, nil)
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
@@ -31,43 +43,77 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_info(:observability_updated, socket) do
+    payload = load_payload()
+
     {:noreply,
      socket
-     |> assign(:payload, load_payload())
-     |> assign(:now, DateTime.utc_now())}
+     |> assign(:payload, payload)
+     |> assign(:now, DateTime.utc_now())
+     |> maybe_refresh_activity_drawer()}
+  end
+
+  @impl true
+  def handle_event("open_activity", %{"stream_id" => stream_id} = params, socket)
+      when is_binary(stream_id) do
+    issue_identifier =
+      params["issue_identifier"]
+      |> case do
+        value when is_binary(value) and value != "" -> value
+        _ -> "unknown issue"
+      end
+
+    now = socket.assigns.now || DateTime.utc_now()
+    {raw_events, readable_events, human_events, error} = load_session_events(stream_id, now)
+    {socket, merged_human_events} = update_human_ledger(socket, stream_id, human_events)
+
+    {:noreply,
+     socket
+     |> assign(:activity_drawer_open, true)
+     |> assign(:activity_mode, "human")
+     |> assign(:activity_stream_id, stream_id)
+     |> assign(:activity_issue_identifier, issue_identifier)
+     |> assign(:activity_events_raw, raw_events)
+     |> assign(:activity_events_readable, readable_events)
+     |> assign(:activity_events_human, merged_human_events)
+     |> assign(:activity_expanded_keys, MapSet.new())
+     |> assign(:activity_error, error)}
+  end
+
+  def handle_event("open_activity", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("set_activity_mode", %{"mode" => mode}, socket)
+      when mode in ["human", "readable", "raw"] do
+    {:noreply, assign(socket, :activity_mode, mode)}
+  end
+
+  def handle_event("set_activity_mode", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("toggle_activity_detail", %{"key" => key}, socket) when is_binary(key) do
+    expanded_keys = socket.assigns.activity_expanded_keys || MapSet.new()
+
+    next_expanded =
+      if MapSet.member?(expanded_keys, key) do
+        MapSet.delete(expanded_keys, key)
+      else
+        MapSet.put(expanded_keys, key)
+      end
+
+    {:noreply, assign(socket, :activity_expanded_keys, next_expanded)}
+  end
+
+  def handle_event("toggle_activity_detail", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("close_activity", _params, socket) do
+    {:noreply, close_activity_drawer(socket)}
   end
 
   @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
-      <header class="hero-card">
-        <div class="hero-grid">
-          <div>
-            <p class="eyebrow">
-              Symphony Observability
-            </p>
-            <h1 class="hero-title">
-              Operations Dashboard
-            </h1>
-            <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
-            </p>
-          </div>
-
-          <div class="status-stack">
-            <span class="status-badge status-badge-live">
-              <span class="status-badge-dot"></span>
-              Live
-            </span>
-            <span class="status-badge status-badge-offline">
-              <span class="status-badge-dot"></span>
-              Offline
-            </span>
-          </div>
-        </div>
-      </header>
-
       <%= if @payload[:error] do %>
         <section class="error-card">
           <h2 class="error-title">
@@ -78,43 +124,40 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </p>
         </section>
       <% else %>
-        <section class="metric-grid">
-          <article class="metric-card">
-            <p class="metric-label">Running</p>
-            <p class="metric-value numeric"><%= @payload.counts.running %></p>
-            <p class="metric-detail">Active issue sessions in the current runtime.</p>
-          </article>
+        <section class="metric-inline-bar" aria-label="Runtime summary">
+          <p class="metric-inline-item">
+            <span class="metric-inline-label">Running</span>
+            <span class="metric-inline-value numeric"><%= @payload.counts.running %></span>
+          </p>
 
-          <article class="metric-card">
-            <p class="metric-label">Retrying</p>
-            <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
-            <p class="metric-detail">Issues waiting for the next retry window.</p>
-          </article>
+          <p class="metric-inline-item">
+            <span class="metric-inline-label">Retrying</span>
+            <span class="metric-inline-value numeric"><%= @payload.counts.retrying %></span>
+          </p>
 
-          <article class="metric-card">
-            <p class="metric-label">Total tokens</p>
-            <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
-            <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
-            </p>
-          </article>
+          <p class="metric-inline-item">
+            <span class="metric-inline-label">Total tokens</span>
+            <span class="metric-inline-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></span>
+          </p>
 
-          <article class="metric-card">
-            <p class="metric-label">Runtime</p>
-            <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
-            <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
-          </article>
-        </section>
+          <p class="metric-inline-item">
+            <span class="metric-inline-label">Runtime</span>
+            <span class="metric-inline-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></span>
+          </p>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
-            </div>
-          </div>
-
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          <p class="metric-inline-item metric-inline-item-live">
+            <span class="metric-inline-label">Live</span>
+            <span class="metric-inline-value">
+              <span class="status-inline status-inline-live">
+                <span class="status-inline-dot"></span>
+                Live
+              </span>
+              <span class="status-inline status-inline-offline">
+                <span class="status-inline-dot"></span>
+                Offline
+              </span>
+            </span>
+          </p>
         </section>
 
         <section class="section-card">
@@ -129,7 +172,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="empty-state">No active sessions.</p>
           <% else %>
             <div class="table-wrap">
-              <table class="data-table data-table-running">
+              <table class="data-table data-table-running data-table-running-main">
                 <colgroup>
                   <col style="width: 12rem;" />
                   <col style="width: 8rem;" />
@@ -176,6 +219,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <% else %>
                           <span class="muted">n/a</span>
                         <% end %>
+
+                        <button
+                          :if={entry.event_stream_id}
+                          type="button"
+                          class="subtle-button"
+                          phx-click="open_activity"
+                          phx-value-stream_id={entry.event_stream_id}
+                          phx-value-issue_identifier={entry.issue_identifier}
+                        >
+                          Activity
+                        </button>
                       </div>
                     </td>
                     <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
@@ -244,6 +298,266 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           <% end %>
         </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Rate limits</h2>
+              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+            </div>
+          </div>
+
+          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Inactive sessions</h2>
+              <p class="section-copy">Most recent completed or stopped sessions for this runtime.</p>
+            </div>
+          </div>
+
+          <%= if @payload.inactive_sessions == [] do %>
+            <p class="empty-state">No inactive sessions yet.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table data-table-running">
+                <colgroup>
+                  <col style="width: 12rem;" />
+                  <col style="width: 8rem;" />
+                  <col style="width: 7.5rem;" />
+                  <col style="width: 8.5rem;" />
+                  <col style="width: 10rem;" />
+                  <col />
+                  <col style="width: 10rem;" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>Session</th>
+                    <th>Runtime / turns</th>
+                    <th>Ended</th>
+                    <th>Result</th>
+                    <th>Tokens</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.inactive_sessions}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= entry.issue_identifier || entry.issue_id || "n/a" %></span>
+                        <a :if={entry.issue_identifier} class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>
+                          JSON details
+                        </a>
+                      </div>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(entry.state || "inactive")}>
+                        <%= entry.state || "n/a" %>
+                      </span>
+                    </td>
+                    <td>
+                      <div class="session-stack">
+                        <%= if entry.session_id do %>
+                          <button
+                            type="button"
+                            class="subtle-button"
+                            data-label="Copy ID"
+                            data-copy={entry.session_id}
+                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                          >
+                            Copy ID
+                          </button>
+                        <% else %>
+                          <span class="muted">n/a</span>
+                        <% end %>
+
+                        <button
+                          :if={entry.event_stream_id}
+                          type="button"
+                          class="subtle-button"
+                          phx-click="open_activity"
+                          phx-value-stream_id={entry.event_stream_id}
+                          phx-value-issue_identifier={entry.issue_identifier || entry.issue_id || "unknown issue"}
+                        >
+                          Activity
+                        </button>
+                      </div>
+                    </td>
+                    <td class="numeric">
+                      <%= format_inactive_runtime_and_turns(entry.runtime_seconds, entry.turn_count) %>
+                    </td>
+                    <td class="mono numeric"><%= entry.ended_at || "n/a" %></td>
+                    <td>
+                      <div class="detail-stack">
+                        <span class="event-text" title={format_stop_reason(entry.stop_reason)}>
+                          <%= format_stop_reason(entry.stop_reason) %>
+                        </span>
+                        <span class="muted event-meta">
+                          <%= entry.last_message || to_string(entry.last_event || "n/a") %>
+                        </span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="token-stack numeric">
+                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
+                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+      <% end %>
+
+      <%= if @activity_drawer_open do %>
+        <button
+          type="button"
+          class="activity-drawer-backdrop"
+          style="position: fixed; inset: 0; z-index: 70; border: 0; border-radius: 0; padding: 0; margin: 0; background: rgba(22, 24, 35, 0.36);"
+          phx-click="close_activity"
+          aria-label="Close session activity drawer"
+        >
+        </button>
+
+        <aside
+          class="activity-drawer"
+          style="position: fixed; top: 0; right: 0; bottom: 0; z-index: 80; width: min(38rem, 100vw); height: 100vh; display: flex; flex-direction: column; background: rgba(255, 255, 255, 0.97); border-left: 1px solid var(--line-strong); box-shadow: -18px 0 40px rgba(15, 23, 42, 0.18);"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Session activity drawer"
+        >
+          <header class="activity-drawer-header">
+            <div>
+              <p class="eyebrow">Session activity</p>
+              <h2 class="section-title"><%= @activity_issue_identifier %></h2>
+              <p class="section-copy mono"><%= @activity_stream_id %></p>
+            </div>
+            <div class="activity-drawer-controls">
+              <div class="activity-mode-toggle" role="tablist" aria-label="Activity feed mode">
+                <button
+                  type="button"
+                  class={activity_mode_button_class(@activity_mode == "human")}
+                  phx-click="set_activity_mode"
+                  phx-value-mode="human"
+                >
+                  Human actions
+                </button>
+                <button
+                  type="button"
+                  class={activity_mode_button_class(@activity_mode == "readable")}
+                  phx-click="set_activity_mode"
+                  phx-value-mode="readable"
+                >
+                  Readable
+                </button>
+                <button
+                  type="button"
+                  class={activity_mode_button_class(@activity_mode == "raw")}
+                  phx-click="set_activity_mode"
+                  phx-value-mode="raw"
+                >
+                  Raw
+                </button>
+              </div>
+              <button type="button" class="secondary" phx-click="close_activity">Close</button>
+            </div>
+          </header>
+
+          <section class="activity-drawer-body">
+            <%= if @activity_error do %>
+              <p class="empty-state"><%= @activity_error %></p>
+            <% else %>
+              <%= if visible_activity_events(@activity_mode, @activity_events_human, @activity_events_readable, @activity_events_raw) == [] do %>
+                <%= if @activity_mode == "human" do %>
+                  <p class="empty-state">No human actions yet. Switch to Readable or Raw to inspect all session events.</p>
+                <% else %>
+                  <p class="empty-state">No session events yet.</p>
+                <% end %>
+              <% else %>
+                <ol class="activity-list">
+                  <%= if @activity_mode == "human" do %>
+                    <%= for {event, index} <- Enum.with_index(@activity_events_human) do %>
+                      <% event_key = event.key || "human-event-#{index}" %>
+                      <% expanded = MapSet.member?(@activity_expanded_keys, event_key) %>
+
+                      <li class={if expanded, do: "activity-item activity-item-expanded", else: "activity-item"}>
+                        <button
+                          type="button"
+                          class="activity-item-button"
+                          phx-click="toggle_activity_detail"
+                          phx-value-key={event_key}
+                          aria-expanded={to_string(expanded)}
+                        >
+                          <div class="activity-item-head">
+                            <div class="activity-item-label-wrap">
+                              <span class="state-badge state-badge-active"><%= event.label || "Human Action" %></span>
+                            </div>
+                            <span class="muted mono" title={event.at_iso || "n/a"}>
+                              <%= event.at_relative || "n/a" %>
+                            </span>
+                          </div>
+                          <p class="activity-item-message"><%= event.message || "n/a" %></p>
+                          <p
+                            class="activity-item-meta muted mono"
+                            title={"session " <> (event.session_id || "n/a")}
+                          >
+                            session <%= event.session_short || "n/a" %> · turn <%= event.turn_count || 0 %>
+                          </p>
+                        </button>
+
+                        <div :if={expanded and is_map(event.details)} class="activity-item-details">
+                          <pre class="code-panel"><%= pretty_value(event.details) %></pre>
+                        </div>
+                      </li>
+                    <% end %>
+                  <% else %>
+                    <%= if @activity_mode == "readable" do %>
+                    <li :for={event <- @activity_events_readable} class="activity-item">
+                      <div class="activity-item-head">
+                        <div class="activity-item-label-wrap">
+                          <span class="state-badge"><%= event.label || "event" %></span>
+                          <span :if={event.count && event.count > 1} class="activity-count">x<%= event.count %></span>
+                        </div>
+                        <span class="muted mono" title={event.at_iso || "n/a"}>
+                          <%= event.at_relative || "n/a" %>
+                        </span>
+                      </div>
+                      <p class="activity-item-message"><%= event.message || "n/a" %></p>
+                      <p
+                        class="activity-item-meta muted mono"
+                        title={"session " <> (event.session_id || "n/a")}
+                      >
+                        session <%= event.session_short || "n/a" %> · turn <%= event.turn_count || 0 %>
+                      </p>
+                    </li>
+                    <% else %>
+                    <li :for={event <- @activity_events_raw} class="activity-item">
+                      <div class="activity-item-head">
+                        <span class="state-badge"><%= event.label || event.event || "event" %></span>
+                        <span class="muted mono" title={event.at_iso || "n/a"}>
+                          <%= event.at_relative || "n/a" %>
+                        </span>
+                      </div>
+                      <p class="activity-item-message"><%= event.message || "n/a" %></p>
+                      <p
+                        class="activity-item-meta muted mono"
+                        title={"session " <> (event.session_id || "n/a")}
+                      >
+                        session <%= event.session_short || "n/a" %> · turn <%= event.turn_count || 0 %>
+                      </p>
+                    </li>
+                    <% end %>
+                  <% end %>
+                </ol>
+              <% end %>
+            <% end %>
+          </section>
+        </aside>
       <% end %>
     </section>
     """
@@ -278,6 +592,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_runtime_and_turns(started_at, _turn_count, now),
     do: format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))
+
+  defp format_inactive_runtime_and_turns(runtime_seconds, turn_count)
+       when is_integer(turn_count) and turn_count > 0 do
+    "#{format_runtime_seconds(runtime_seconds)} / #{turn_count}"
+  end
+
+  defp format_inactive_runtime_and_turns(runtime_seconds, _turn_count),
+    do: format_runtime_seconds(runtime_seconds)
 
   defp format_runtime_seconds(seconds) when is_number(seconds) do
     whole_seconds = max(trunc(seconds), 0)
@@ -319,6 +641,127 @@ defmodule SymphonyElixirWeb.DashboardLive do
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
       true -> base
     end
+  end
+
+  defp format_stop_reason(nil), do: "n/a"
+
+  defp format_stop_reason(reason) when is_binary(reason) do
+    reason
+    |> String.replace("_", " ")
+    |> String.trim()
+  end
+
+  defp format_stop_reason(reason), do: to_string(reason)
+
+  defp maybe_refresh_activity_drawer(socket) do
+    if socket.assigns.activity_drawer_open and is_binary(socket.assigns.activity_stream_id) do
+      now = socket.assigns.now || DateTime.utc_now()
+
+      {raw_events, readable_events, human_events, error} =
+        load_session_events(socket.assigns.activity_stream_id, now)
+
+      {socket, merged_human_events} =
+        update_human_ledger(socket, socket.assigns.activity_stream_id, human_events)
+
+      socket
+      |> assign(:activity_events_raw, raw_events)
+      |> assign(:activity_events_readable, readable_events)
+      |> assign(:activity_events_human, merged_human_events)
+      |> assign(:activity_error, error)
+    else
+      socket
+    end
+  end
+
+  defp load_session_events(stream_id, %DateTime{} = now)
+       when is_binary(stream_id) and stream_id != "" do
+    case Presenter.session_events_payload(
+           stream_id,
+           @session_events_limit,
+           orchestrator(),
+           snapshot_timeout_ms()
+         ) do
+      {:ok, %{events: events}} when is_list(events) ->
+        {
+          SessionActivityFormatter.raw_events(events, now),
+          SessionActivityFormatter.readable_events(events, now),
+          SessionActivityFormatter.human_action_events(events, now),
+          nil
+        }
+
+      {:error, :session_not_found} ->
+        {[], [], [], "Session timeline not found."}
+
+      _ ->
+        {[], [], [], "Session timeline unavailable."}
+    end
+  end
+
+  defp load_session_events(_stream_id, _now), do: {[], [], [], "Session timeline unavailable."}
+
+  defp update_human_ledger(socket, stream_id, new_events)
+       when is_binary(stream_id) and is_list(new_events) do
+    ledger = socket.assigns.activity_human_ledger || %{}
+    existing = Map.get(ledger, stream_id, [])
+
+    merged =
+      merge_human_ledger_events(existing, new_events)
+      |> Enum.take(-@session_human_ledger_limit)
+
+    {
+      assign(socket, :activity_human_ledger, Map.put(ledger, stream_id, merged)),
+      merged
+    }
+  end
+
+  defp update_human_ledger(socket, _stream_id, _new_events), do: {socket, []}
+
+  defp merge_human_ledger_events(existing, incoming) when is_list(existing) and is_list(incoming) do
+    (existing ++ incoming)
+    |> Enum.reduce(%{}, fn event, acc ->
+      Map.put(acc, human_event_identity(event), event)
+    end)
+    |> Map.values()
+    |> Enum.sort_by(&human_event_sort_key/1)
+  end
+
+  defp merge_human_ledger_events(_existing, incoming) when is_list(incoming), do: incoming
+  defp merge_human_ledger_events(_existing, _incoming), do: []
+
+  defp human_event_identity(%{} = event) do
+    Map.get(event, :key) || [Map.get(event, :at_iso), Map.get(event, :session_id), Map.get(event, :turn_count), Map.get(event, :message)]
+  end
+
+  defp human_event_identity(event), do: event
+
+  defp human_event_sort_key(%{} = event) do
+    {
+      Map.get(event, :at_iso) || "",
+      Map.get(event, :turn_count) || 0,
+      Map.get(event, :key) || ""
+    }
+  end
+
+  defp human_event_sort_key(_event), do: {"", 0, ""}
+
+  defp visible_activity_events("human", human_events, _readable_events, _raw_events), do: human_events
+  defp visible_activity_events("raw", _human_events, _readable_events, raw_events), do: raw_events
+  defp visible_activity_events(_mode, _human_events, readable_events, _raw_events), do: readable_events
+
+  defp activity_mode_button_class(true), do: "activity-mode-button activity-mode-button-active"
+  defp activity_mode_button_class(false), do: "activity-mode-button"
+
+  defp close_activity_drawer(socket) do
+    socket
+    |> assign(:activity_drawer_open, false)
+    |> assign(:activity_mode, "human")
+    |> assign(:activity_stream_id, nil)
+    |> assign(:activity_issue_identifier, nil)
+    |> assign(:activity_events_raw, [])
+    |> assign(:activity_events_readable, [])
+    |> assign(:activity_events_human, [])
+    |> assign(:activity_expanded_keys, MapSet.new())
+    |> assign(:activity_error, nil)
   end
 
   defp schedule_runtime_tick do

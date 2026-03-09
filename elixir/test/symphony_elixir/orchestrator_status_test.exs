@@ -101,6 +101,207 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator session events returns timeline entries for known stream ids" do
+    issue_id = "issue-session-events"
+    stream_id = "mt-301-session-#{System.unique_integer([:positive])}"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-301",
+      title: "Session events test",
+      description: "Track session timeline",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-301"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :SessionEventsOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      event_stream_id: stream_id,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:timeline_events, %{stream_id => []})
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         session_id: "thread-session-events",
+         timestamp: now
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/agent_message_content_delta",
+           "params" => %{
+             "msg" => %{
+               "content" => "secret lin_api_abcd1234 should be redacted"
+             }
+           }
+         },
+         timestamp: now
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :tool_call_completed,
+         payload: %{
+           "method" => "item/tool/call",
+           "params" => %{
+             "tool" => "linear_graphql",
+             "arguments" => %{
+               "query" => "mutation UpdateIssue($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+               "variables" => %{
+                 "issueId" => "issue-session-events",
+                 "stateId" => "state-done"
+               }
+             }
+           }
+         },
+         timestamp: now
+       }}
+    )
+
+    assert {:ok, events} = Orchestrator.session_events(orchestrator_name, stream_id, 10, 1_000)
+    assert length(events) == 3
+
+    first = Enum.at(events, 0)
+    second = Enum.at(events, 1)
+    third = Enum.at(events, 2)
+
+    assert (first[:event] || first["event"]) == "session_started"
+    assert (second[:event] || second["event"]) == "notification"
+    refute String.contains?(second[:message] || second["message"] || "", "lin_api_")
+    assert String.contains?(second[:message] || second["message"] || "", "[REDACTED]")
+    assert (third[:event] || third["event"]) == "tool_call_completed"
+    assert (third[:kind] || third["kind"]) == "human_action"
+    assert (third[:category] || third["category"]) == "linear"
+    assert (third[:action] || third["action"]) == "linear_status_change"
+
+    assert (third[:details] || third["details"]) == %{
+             "issue_id" => "issue-session-events",
+             "operation" => "issueUpdate",
+             "state_id" => "state-done"
+           }
+
+    assert {:error, :session_not_found} =
+             Orchestrator.session_events(orchestrator_name, "missing-stream", 10, 1_000)
+  end
+
+  test "session events reads persisted history for active sessions beyond in-memory window" do
+    issue_id = "issue-persisted-session-events"
+    stream_id = "mt-persisted-session"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-302",
+      title: "Session events persisted test",
+      description: "Track persisted timeline history",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-302"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :PersistedSessionEventsOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      event_stream_id: stream_id,
+      session_id: "thread-persisted",
+      turn_count: 1,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _state ->
+      %{
+        initial_state
+        | running: %{issue_id => running_entry},
+          claimed: MapSet.put(initial_state.claimed, issue_id),
+          timeline_events: %{
+            stream_id => [
+              %{
+                at: "2026-03-08T20:59:59Z",
+                issue_identifier: issue.identifier,
+                session_id: "thread-persisted",
+                turn_count: 1,
+                event: "notification",
+                label: "notification",
+                message: "in-memory-latest"
+              }
+            ]
+          }
+      }
+    end)
+
+    for index <- 1..260 do
+      :ok =
+        SymphonyElixir.SessionTimelineStore.append(stream_id, %{
+          at: "2026-03-08T20:#{Integer.to_string(rem(index, 60)) |> String.pad_leading(2, "0")}:00Z",
+          issue_identifier: issue.identifier,
+          session_id: "thread-persisted",
+          turn_count: 1,
+          event: "notification",
+          label: "notification",
+          message: "persisted-#{index}"
+        })
+    end
+
+    assert {:ok, events} = Orchestrator.session_events(orchestrator_name, stream_id, 250, 1_000)
+    assert length(events) == 250
+    first = Enum.at(events, 0)
+    last = Enum.at(events, -1)
+
+    assert (first[:message] || first["message"]) == "persisted-12"
+    assert (last[:message] || last["message"]) == "in-memory-latest"
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
