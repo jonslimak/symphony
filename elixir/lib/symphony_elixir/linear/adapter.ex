@@ -43,6 +43,11 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issues_by_states(states), do: client_module().fetch_issues_by_states(states)
 
+  @spec fetch_project_issues(pos_integer()) :: {:ok, [term()]} | {:error, term()}
+  def fetch_project_issues(limit) when is_integer(limit) and limit > 0 do
+    client_module().fetch_project_issues(limit)
+  end
+
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
 

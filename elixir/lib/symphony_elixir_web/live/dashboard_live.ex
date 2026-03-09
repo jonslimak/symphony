@@ -5,10 +5,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Tracker
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter, SessionActivityFormatter}
   @runtime_tick_ms 1_000
   @session_events_limit 10_000
   @session_human_ledger_limit 5_000
+  @project_tickets_limit 100
 
   @impl true
   def mount(_params, _session, socket) do
@@ -26,6 +30,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:activity_human_ledger, %{})
       |> assign(:activity_expanded_keys, MapSet.new())
       |> assign(:activity_error, nil)
+      |> assign(:project_tickets_limit, @project_tickets_limit)
+      |> assign(:project_tickets, [])
+      |> assign(:project_tickets_error, nil)
+      |> assign(:project_tickets_fetched_at, nil)
+      |> refresh_project_tickets()
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
@@ -49,7 +58,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
      socket
      |> assign(:payload, payload)
      |> assign(:now, DateTime.utc_now())
-     |> maybe_refresh_activity_drawer()}
+     |> maybe_refresh_activity_drawer()
+     |> refresh_project_tickets()}
   end
 
   @impl true
@@ -164,7 +174,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
             </div>
           </div>
 
@@ -264,7 +273,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
             </div>
           </div>
 
@@ -303,11 +311,95 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
             </div>
           </div>
 
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          <pre class="code-panel code-panel-plain"><%= pretty_value(@payload.rate_limits) %></pre>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">
+                <a
+                  :if={linear_project_issues_url()}
+                  class="issue-link"
+                  href={linear_project_issues_url()}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Project tickets
+                </a>
+                <%= if !linear_project_issues_url() do %>
+                  Project tickets
+                <% end %>
+              </h2>
+            </div>
+          </div>
+
+          <p :if={@project_tickets_error} class="empty-state"><%= @project_tickets_error %></p>
+
+          <%= if @project_tickets == [] do %>
+            <p class="empty-state">No project tickets found.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 860px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>Updated</th>
+                    <th>Linear</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <%= for {state_name, entries} <- grouped_project_tickets(@project_tickets) do %>
+                    <tr>
+                      <td colspan="4">
+                        <span class={state_badge_class(state_name)}><%= state_name %></span>
+                      </td>
+                    </tr>
+
+                    <tr :for={entry <- entries}>
+                      <td>
+                        <div class="detail-stack">
+                          <span class="issue-id"><%= project_ticket_identifier(entry) %></span>
+                          <a
+                            :if={project_ticket_url(entry)}
+                            class="issue-link"
+                            href={project_ticket_url(entry)}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            <%= project_ticket_title(entry) %>
+                          </a>
+                          <span :if={!project_ticket_url(entry)} class="muted"><%= project_ticket_title(entry) %></span>
+                        </div>
+                      </td>
+                      <td>
+                        <span class={state_badge_class(project_ticket_state(entry))}>
+                          <%= project_ticket_state(entry) %>
+                        </span>
+                      </td>
+                      <td class="mono numeric"><%= format_project_ticket_updated_at(project_ticket_updated_at(entry)) %></td>
+                      <td>
+                        <a
+                          :if={project_ticket_url(entry)}
+                          class="issue-link"
+                          href={project_ticket_url(entry)}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Open
+                        </a>
+                        <span :if={!project_ticket_url(entry)} class="muted">n/a</span>
+                      </td>
+                    </tr>
+                  <% end %>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">
@@ -322,7 +414,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="empty-state">No inactive sessions yet.</p>
           <% else %>
             <div class="table-wrap">
-              <table class="data-table data-table-running">
+              <table class="data-table data-table-running data-table-running-main">
                 <colgroup>
                   <col style="width: 12rem;" />
                   <col style="width: 8rem;" />
@@ -652,6 +744,143 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_stop_reason(reason), do: to_string(reason)
+
+  defp refresh_project_tickets(socket) do
+    case load_project_tickets() do
+      {:ok, tickets} ->
+        socket
+        |> assign(:project_tickets, tickets)
+        |> assign(:project_tickets_error, nil)
+        |> assign(:project_tickets_fetched_at, DateTime.utc_now())
+
+      {:error, reason} ->
+        socket
+        |> assign(:project_tickets_error, format_project_tickets_error(reason))
+        |> assign(:project_tickets_fetched_at, DateTime.utc_now())
+    end
+  end
+
+  defp load_project_tickets do
+    case project_tickets_fetcher().(@project_tickets_limit) do
+      {:ok, issues} when is_list(issues) ->
+        {:ok,
+         issues
+         |> Enum.filter(&match?(%Issue{}, &1))
+         |> Enum.take(@project_tickets_limit)
+         |> Enum.sort(&project_ticket_before?/2)}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:unexpected_project_tickets_payload, other}}
+    end
+  end
+
+  defp grouped_project_tickets(tickets) when is_list(tickets) do
+    tickets
+    |> Enum.chunk_by(&project_ticket_state_key/1)
+    |> Enum.map(fn
+      [first | _] = entries -> {project_ticket_state(first), entries}
+      [] -> {"Unknown", []}
+    end)
+  end
+
+  defp grouped_project_tickets(_tickets), do: []
+
+  defp project_ticket_before?(left, right) do
+    left_state = project_ticket_state_key(left)
+    right_state = project_ticket_state_key(right)
+
+    cond do
+      left_state < right_state ->
+        true
+
+      left_state > right_state ->
+        false
+
+      project_ticket_updated_sort_value(left) > project_ticket_updated_sort_value(right) ->
+        true
+
+      project_ticket_updated_sort_value(left) < project_ticket_updated_sort_value(right) ->
+        false
+
+      true ->
+        project_ticket_identifier_sort_value(left) <= project_ticket_identifier_sort_value(right)
+    end
+  end
+
+  defp project_ticket_updated_sort_value(%Issue{updated_at: %DateTime{} = updated_at}) do
+    DateTime.to_unix(updated_at, :microsecond)
+  end
+
+  defp project_ticket_updated_sort_value(_issue), do: -1
+
+  defp project_ticket_state_key(%Issue{state: state}) when is_binary(state) do
+    state
+    |> String.trim()
+    |> case do
+      "" -> "unknown"
+      value -> String.downcase(value)
+    end
+  end
+
+  defp project_ticket_state_key(_issue), do: "unknown"
+
+  defp project_ticket_identifier_sort_value(%Issue{} = issue) do
+    issue
+    |> project_ticket_identifier()
+    |> String.downcase()
+  end
+
+  defp project_ticket_identifier_sort_value(_issue), do: "zzzzzzzz"
+
+  defp project_ticket_identifier(%Issue{identifier: identifier}) when is_binary(identifier) and identifier != "",
+    do: identifier
+
+  defp project_ticket_identifier(%Issue{id: id}) when is_binary(id) and id != "", do: id
+  defp project_ticket_identifier(_issue), do: "n/a"
+
+  defp project_ticket_title(%Issue{title: title}) when is_binary(title) and title != "", do: title
+  defp project_ticket_title(_issue), do: "No title"
+
+  defp project_ticket_state(%Issue{state: state}) when is_binary(state) do
+    case String.trim(state) do
+      "" -> "Unknown"
+      normalized -> normalized
+    end
+  end
+
+  defp project_ticket_state(_issue), do: "Unknown"
+
+  defp project_ticket_url(%Issue{url: url}) when is_binary(url) and url != "", do: url
+  defp project_ticket_url(_issue), do: nil
+
+  defp project_ticket_updated_at(%Issue{updated_at: %DateTime{} = updated_at}), do: updated_at
+  defp project_ticket_updated_at(_issue), do: nil
+
+  defp format_project_ticket_updated_at(%DateTime{} = updated_at),
+    do: DateTime.truncate(updated_at, :second) |> DateTime.to_iso8601()
+
+  defp format_project_ticket_updated_at(_updated_at), do: "n/a"
+
+  defp format_project_tickets_error(reason) do
+    "Project tickets refresh failed: #{inspect(reason)}"
+  end
+
+  defp linear_project_issues_url do
+    case Config.linear_project_slug() do
+      project_slug when is_binary(project_slug) and project_slug != "" ->
+        "https://linear.app/validation/project/#{project_slug}/issues"
+
+      _ ->
+        nil
+    end
+  end
+
+  defp project_tickets_fetcher do
+    Endpoint.config(:project_tickets_fetcher) || &Tracker.fetch_project_issues/1
+  end
 
   defp maybe_refresh_activity_drawer(socket) do
     if socket.assigns.activity_drawer_open and is_binary(socket.assigns.activity_stream_id) do

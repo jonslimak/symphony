@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, SessionTimelineStore, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, InactiveSessionStore, SessionTimelineStore, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -70,6 +70,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     run_terminal_workspace_cleanup()
     state = maybe_cleanup_timeline_files(state, true)
+    state = load_persisted_inactive_sessions(state)
     :ok = schedule_tick(0)
 
     {:ok, state}
@@ -1776,11 +1777,32 @@ defmodule SymphonyElixir.Orchestrator do
       [entry | state.inactive_sessions]
       |> Enum.take(@inactive_sessions_limit)
 
+    state =
+      case InactiveSessionStore.append(entry) do
+        :ok ->
+          state
+
+        {:error, reason} ->
+          Logger.warning("Failed to persist inactive session issue_identifier=#{Map.get(running_entry, :identifier)}: #{inspect(reason)}")
+          state
+      end
+
     %{state | inactive_sessions: inactive_sessions}
     |> prune_timeline_events()
   end
 
   defp record_inactive_session(state, _running_entry, _stop_reason), do: state
+
+  defp load_persisted_inactive_sessions(%State{} = state) do
+    case InactiveSessionStore.read_recent(@inactive_sessions_limit) do
+      {:ok, inactive_sessions} when is_list(inactive_sessions) ->
+        %{state | inactive_sessions: Enum.take(inactive_sessions, @inactive_sessions_limit)}
+
+      {:error, reason} ->
+        Logger.warning("Failed to load persisted inactive sessions: #{inspect(reason)}")
+        state
+    end
+  end
 
   defp map_value(map, key) when is_map(map), do: Map.get(map, key)
   defp map_value(_map, _key), do: nil

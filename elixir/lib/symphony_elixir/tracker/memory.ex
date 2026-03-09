@@ -25,6 +25,11 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_project_issues(pos_integer()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_project_issues(limit) when is_integer(limit) and limit > 0 do
+    {:ok, issue_entries() |> Enum.take(limit)}
+  end
+
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
     wanted_ids = MapSet.new(issue_ids)

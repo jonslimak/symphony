@@ -302,6 +302,122 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert (last[:message] || last["message"]) == "in-memory-latest"
   end
 
+  test "inactive sessions persist across orchestrator restart" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-inactive-sessions-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace_root)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    persisted_entry = %{
+      issue_id: "issue-persisted",
+      identifier: "MT-351",
+      state: "Done",
+      event_stream_id: "mt-351-stream",
+      session_id: "thread-persisted",
+      turn_count: 1,
+      started_at: DateTime.add(now, -120, :second),
+      ended_at: DateTime.add(now, -90, :second),
+      stop_reason: "completed",
+      runtime_seconds: 30,
+      last_codex_timestamp: DateTime.add(now, -90, :second),
+      last_codex_message: "persisted complete",
+      last_codex_event: :turn_completed,
+      codex_input_tokens: 10,
+      codex_output_tokens: 5,
+      codex_total_tokens: 15
+    }
+
+    assert :ok = SymphonyElixir.InactiveSessionStore.append(persisted_entry)
+
+    orchestrator_name = Module.concat(__MODULE__, :InactivePersistenceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm_rf(workspace_root)
+    end)
+
+    snapshot = wait_for_snapshot(pid, fn snapshot -> length(snapshot.inactive_sessions) >= 1 end, 1_000)
+    assert Enum.any?(snapshot.inactive_sessions, &(&1.identifier == "MT-351"))
+
+    issue_id = "issue-runtime-inactive"
+    running_ref = make_ref()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-352",
+      title: "Inactive persistence runtime session",
+      description: "Ensure runtime inactive sessions append to store",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-352"
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: running_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      event_stream_id: "mt-352-stream",
+      session_id: "thread-runtime",
+      turn_count: 2,
+      started_at: DateTime.add(now, -30, :second),
+      last_codex_timestamp: now,
+      last_codex_message: "runtime complete",
+      last_codex_event: :turn_completed,
+      codex_input_tokens: 20,
+      codex_output_tokens: 10,
+      codex_total_tokens: 30
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.put(state.running, issue_id, running_entry),
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    send(pid, {:DOWN, running_ref, :process, self(), :normal})
+
+    updated_snapshot =
+      wait_for_snapshot(
+        pid,
+        fn snapshot -> Enum.any?(snapshot.inactive_sessions, &(&1.identifier == "MT-352")) end,
+        1_000
+      )
+
+    assert hd(updated_snapshot.inactive_sessions).identifier == "MT-352"
+
+    Process.exit(pid, :normal)
+
+    restarted_name = Module.concat(__MODULE__, :InactivePersistenceOrchestratorRestarted)
+    {:ok, restarted_pid} = Orchestrator.start_link(name: restarted_name)
+
+    on_exit(fn ->
+      if Process.alive?(restarted_pid), do: Process.exit(restarted_pid, :normal)
+    end)
+
+    restarted_snapshot =
+      wait_for_snapshot(
+        restarted_pid,
+        fn snapshot ->
+          identifiers = Enum.map(snapshot.inactive_sessions, & &1.identifier)
+          "MT-351" in identifiers and "MT-352" in identifiers
+        end,
+        1_000
+      )
+
+    identifiers = Enum.map(restarted_snapshot.inactive_sessions, & &1.identifier)
+    assert "MT-351" in identifiers
+    assert "MT-352" in identifiers
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 

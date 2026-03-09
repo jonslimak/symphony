@@ -348,6 +348,88 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Enum.map(merged, & &1.identifier) == ["MT-1", "MT-2", "MT-3"]
   end
 
+  test "linear client fetch_project_issues paginates up to limit" do
+    request_fun = fn payload, _headers ->
+      variables = payload["variables"] || %{}
+      send(self(), {:project_issues_query, Map.get(variables, :first), Map.get(variables, :after)})
+
+      case Map.get(variables, :after) do
+        nil ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "issues" => %{
+                   "nodes" => [
+                     %{
+                       "id" => "issue-1",
+                       "identifier" => "MT-1",
+                       "title" => "First",
+                       "state" => %{"name" => "Todo"},
+                       "url" => "https://linear.app/example/issue/MT-1",
+                       "updatedAt" => "2026-01-01T10:00:00Z"
+                     },
+                     %{
+                       "id" => "issue-2",
+                       "identifier" => "MT-2",
+                       "title" => "Second",
+                       "state" => %{"name" => "Todo"},
+                       "url" => "https://linear.app/example/issue/MT-2",
+                       "updatedAt" => "2026-01-01T11:00:00Z"
+                     }
+                   ],
+                   "pageInfo" => %{"hasNextPage" => true, "endCursor" => "cursor-1"}
+                 }
+               }
+             }
+           }}
+
+        "cursor-1" ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "issues" => %{
+                   "nodes" => [
+                     %{
+                       "id" => "issue-3",
+                       "identifier" => "MT-3",
+                       "title" => "Third",
+                       "state" => %{"name" => "Backlog"},
+                       "url" => "https://linear.app/example/issue/MT-3",
+                       "updatedAt" => "2026-01-01T12:00:00Z"
+                     }
+                   ],
+                   "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                 }
+               }
+             }
+           }}
+      end
+    end
+
+    assert {:ok, issues} = Client.fetch_project_issues(3, request_fun: request_fun)
+    assert Enum.map(issues, & &1.identifier) == ["MT-1", "MT-2", "MT-3"]
+    assert_receive {:project_issues_query, 3, nil}
+    assert_receive {:project_issues_query, 1, "cursor-1"}
+  end
+
+  test "linear client fetch_project_issues surfaces validation and graphql errors" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_project_slug: nil)
+    assert {:error, :missing_linear_project_slug} = Client.fetch_project_issues(100)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_project_slug: "project")
+
+    assert {:error, {:linear_graphql_errors, [%{"message" => "boom"}]}} =
+             Client.fetch_project_issues(100,
+               request_fun: fn _payload, _headers ->
+                 {:ok, %{status: 200, body: %{"errors" => [%{"message" => "boom"}]}}}
+               end
+             )
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->

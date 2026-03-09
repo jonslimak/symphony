@@ -20,6 +20,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, states}
     end
 
+    def fetch_project_issues(limit) do
+      send(self(), {:fetch_project_issues_called, limit})
+      {:ok, Enum.to_list(1..limit)}
+    end
+
     def fetch_issue_states_by_ids(issue_ids) do
       send(self(), {:fetch_issue_states_by_ids_called, issue_ids})
       {:ok, issue_ids}
@@ -203,6 +208,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert SymphonyElixir.Tracker.adapter() == Memory
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues()
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
+    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_project_issues(1)
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
@@ -225,6 +231,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, ["Todo"]} = Adapter.fetch_issues_by_states(["Todo"])
     assert_receive {:fetch_issues_by_states_called, ["Todo"]}
+
+    assert {:ok, [1, 2, 3]} = Adapter.fetch_project_issues(3)
+    assert_receive {:fetch_project_issues_called, 3}
 
     assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"])
     assert_receive {:fetch_issue_states_by_ids_called, ["issue-1"]}
@@ -733,6 +742,90 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
   end
 
+  test "dashboard liveview renders project tickets and keeps stale list on fetch error" do
+    orchestrator_name = Module.concat(__MODULE__, :ProjectTicketOrchestrator)
+    snapshot = static_snapshot()
+    parent = self()
+
+    project_tickets = [
+      %Issue{
+        id: "issue-300",
+        identifier: "MT-300",
+        title: "Backlog item",
+        state: "Backlog",
+        url: "https://linear.app/example/issue/MT-300",
+        updated_at: ~U[2026-01-01 12:00:00Z]
+      },
+      %Issue{
+        id: "issue-200",
+        identifier: "MT-200",
+        title: "Older todo item",
+        state: "Todo",
+        url: "https://linear.app/example/issue/MT-200",
+        updated_at: ~U[2026-01-01 10:00:00Z]
+      },
+      %Issue{
+        id: "issue-100",
+        identifier: "MT-100",
+        title: "Newer todo item",
+        state: "Todo",
+        url: "https://linear.app/example/issue/MT-100",
+        updated_at: ~U[2026-01-01 11:00:00Z]
+      }
+    ]
+
+    {:ok, ticket_source} = Agent.start_link(fn -> {:ok, project_tickets} end)
+
+    fetcher = fn limit ->
+      send(parent, {:project_tickets_fetch, limit})
+      Agent.get(ticket_source, & &1)
+    end
+
+    {:ok, _orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        session_events: static_session_events(),
+        refresh: %{
+          queued: true,
+          coalesced: true,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      project_tickets_fetcher: fetcher
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert_receive {:project_tickets_fetch, 100}
+
+    assert html =~ "Project tickets"
+    assert html =~ "https://linear.app/validation/project/project/issues"
+    assert html =~ "MT-300"
+    assert html =~ "MT-100"
+    assert html =~ "MT-200"
+    assert html =~ "https://linear.app/example/issue/MT-100"
+    assert html_index!(html, "Rate limits") < html_index!(html, "Project tickets")
+    assert html_index!(html, "Backlog") < html_index!(html, "Todo")
+    assert html_index!(html, "MT-100") < html_index!(html, "MT-200")
+
+    Agent.update(ticket_source, fn _state -> {:error, :boom} end)
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      refreshed = render(view)
+
+      refreshed =~ "Project tickets refresh failed: :boom" and
+        refreshed =~ "MT-300" and
+        refreshed =~ "MT-100" and
+        refreshed =~ "MT-200"
+    end)
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -815,6 +908,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> Application.get_env(SymphonyElixirWeb.Endpoint, [])
       |> Keyword.merge(server: false, secret_key_base: String.duplicate("s", 64))
       |> Keyword.merge(overrides)
+      |> Keyword.put_new(:project_tickets_fetcher, fn _limit -> {:ok, []} end)
 
     Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
@@ -943,6 +1037,13 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
+  defp html_index!(html, value) do
+    case :binary.match(html, value) do
+      {index, _length} -> index
+      :nomatch -> flunk("expected to find #{inspect(value)} in HTML")
+    end
+  end
 
   defp ensure_workflow_store_running do
     if Process.whereis(WorkflowStore) do
