@@ -303,6 +303,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
           }
         ]
       },
+      "attachments" => %{
+        "nodes" => [
+          %{
+            "title" => "Older PR",
+            "url" => "https://github.com/example/repo/pull/10",
+            "createdAt" => "2026-01-01T12:00:00Z"
+          },
+          %{
+            "title" => "Newest PR",
+            "url" => "https://github.com/example/repo/pull/11",
+            "createdAt" => "2026-01-02T12:00:00Z"
+          }
+        ]
+      },
       "createdAt" => "2026-01-01T00:00:00Z",
       "updatedAt" => "2026-01-02T00:00:00Z"
     }
@@ -315,6 +329,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.state == "Todo"
     assert issue.assignee_id == "user-1"
     assert issue.assigned_to_worker
+    assert issue.latest_resource_title == "Newest PR"
+    assert issue.latest_resource_url == "https://github.com/example/repo/pull/11"
   end
 
   test "linear client marks explicitly unassigned issues as not routed to worker" do

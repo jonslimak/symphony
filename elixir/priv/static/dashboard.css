@@ -50,7 +50,7 @@
   --shadow-lg: 0 20px 50px rgba(15, 23, 42, 0.08);
   --font-size-ui: 0.82rem;
   --font-size-running-head: 0.49rem;
-  --font-size-time: 0.62rem;
+  --font-size-time: 0.56rem;
 }
 
 * {
@@ -170,6 +170,26 @@ pre,
 .dashboard-shell {
   display: grid;
   gap: 1rem;
+}
+
+.section-running {
+  order: 2;
+}
+
+.section-project-tickets {
+  order: 3;
+}
+
+.section-inactive {
+  order: 4;
+}
+
+.section-retry {
+  order: 5;
+}
+
+.section-rate-limits {
+  order: 6;
 }
 
 .section-card,
@@ -321,6 +341,28 @@ pre,
   font-size: var(--font-size-ui);
 }
 
+.table-cell-small,
+.table-cell-small .event-text,
+.table-cell-small .event-meta,
+.table-cell-small .muted,
+.table-cell-small .token-stack span {
+  font-size: var(--font-size-time) !important;
+}
+
+.project-updated-small {
+  font-size: var(--font-size-time) !important;
+}
+
+.project-link-action {
+  font-size: var(--font-size-time) !important;
+}
+
+.session-action-button {
+  padding: 0.22rem 0.58rem;
+  font-size: 0.71rem;
+  min-height: 1.55rem;
+}
+
 .issue-stack,
 .session-stack,
 .detail-stack,
@@ -376,6 +418,89 @@ pre,
   background: var(--danger-soft);
   border-color: #f6d3cf;
   color: var(--danger);
+}
+
+.ticket-status-button {
+  box-shadow: none !important;
+  transform: none !important;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.ticket-status-button:hover {
+  transform: none !important;
+  box-shadow: none !important;
+  border-color: var(--muted);
+}
+
+.ticket-editor-row td {
+  padding-top: 0.35rem;
+}
+
+.ticket-editor-popover {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fbfbfc;
+  padding: 0.6rem 0.75rem;
+}
+
+.ticket-editor-body {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.ticket-editor-body-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: nowrap;
+}
+
+.ticket-editor-label {
+  color: var(--muted);
+  font-size: var(--font-size-ui);
+  white-space: nowrap;
+}
+
+.ticket-editor-input {
+  width: auto;
+  flex: 1 1 auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  padding: 0.32rem 0.5rem;
+  font: inherit;
+  font-size: var(--font-size-ui);
+  background: white;
+  color: var(--ink);
+}
+
+.ticket-editor-select {
+  max-width: 15rem;
+}
+
+.ticket-editor-comment-input {
+  min-width: 18rem;
+}
+
+.ticket-editor-actions {
+  display: inline-flex;
+  gap: 0.45rem;
+  justify-content: flex-start;
+  flex: 0 0 auto;
+}
+
+.ticket-editor-actions button {
+  padding: 0.22rem 0.56rem;
+  font-size: 0.74rem;
+  box-shadow: none;
+  transform: none;
+}
+
+.ticket-editor-actions button:hover {
+  box-shadow: none;
+  transform: none;
 }
 
 .issue-id {

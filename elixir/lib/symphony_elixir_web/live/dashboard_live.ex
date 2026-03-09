@@ -34,6 +34,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:project_tickets, [])
       |> assign(:project_tickets_error, nil)
       |> assign(:project_tickets_fetched_at, nil)
+      |> assign(:ticket_editor, nil)
+      |> assign(:ticket_status_drafts, %{})
+      |> assign(:ticket_comment_drafts, %{})
+      |> assign(:ticket_status_options, ticket_status_options())
       |> refresh_project_tickets()
 
     if connected?(socket) do
@@ -121,6 +125,104 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("open_ticket_status_editor", %{"issue_id" => issue_id} = params, socket)
+      when is_binary(issue_id) and issue_id != "" do
+    default_status = normalize_status_draft(params["current_state"])
+
+    next_status =
+      socket.assigns.ticket_status_drafts
+      |> ticket_status_draft(issue_id, default_status)
+
+    {:noreply,
+     socket
+     |> assign(:ticket_editor, %{issue_id: issue_id, mode: "status"})
+     |> put_ticket_status_draft(issue_id, next_status)}
+  end
+
+  def handle_event("open_ticket_status_editor", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("open_ticket_comment_editor", %{"issue_id" => issue_id}, socket)
+      when is_binary(issue_id) and issue_id != "" do
+    {:noreply,
+     socket
+     |> assign(:ticket_editor, %{issue_id: issue_id, mode: "comment"})
+     |> put_ticket_comment_draft(issue_id, ticket_comment_draft(socket.assigns.ticket_comment_drafts, issue_id, ""))}
+  end
+
+  def handle_event("open_ticket_comment_editor", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("close_ticket_editor", _params, socket) do
+    {:noreply, assign(socket, :ticket_editor, nil)}
+  end
+
+  @impl true
+  def handle_event("ticket_status_change", %{"issue_id" => issue_id, "status" => status}, socket)
+      when is_binary(issue_id) and issue_id != "" do
+    {:noreply, put_ticket_status_draft(socket, issue_id, normalize_status_draft(status))}
+  end
+
+  def handle_event("ticket_status_change", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("ticket_comment_change", %{"issue_id" => issue_id, "comment_body" => body}, socket)
+      when is_binary(issue_id) and issue_id != "" do
+    {:noreply, put_ticket_comment_draft(socket, issue_id, to_string(body))}
+  end
+
+  def handle_event("ticket_comment_change", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("submit_ticket_status", %{"issue_id" => issue_id, "status" => raw_status}, socket)
+      when is_binary(issue_id) and issue_id != "" do
+    status = normalize_status_draft(raw_status)
+    socket = put_ticket_status_draft(socket, issue_id, status)
+
+    case find_project_ticket(socket.assigns.project_tickets, issue_id) do
+      %Issue{} = issue ->
+        cond do
+          status == "" ->
+            {:noreply, put_flash(socket, :error, "Choose a status before saving.")}
+
+          !valid_ticket_status?(socket.assigns.ticket_status_options, status) ->
+            {:noreply, put_flash(socket, :error, "Choose a valid status from the list.")}
+
+          true ->
+            submit_ticket_status_update(socket, issue, status)
+        end
+
+      _ ->
+        {:noreply, put_flash(socket, :error, "Ticket not found in the current dashboard snapshot.")}
+    end
+  end
+
+  def handle_event("submit_ticket_status", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("submit_ticket_comment", %{"issue_id" => issue_id, "comment_body" => raw_body}, socket)
+      when is_binary(issue_id) and issue_id != "" do
+    body = to_string(raw_body)
+    socket = put_ticket_comment_draft(socket, issue_id, body)
+
+    case find_project_ticket(socket.assigns.project_tickets, issue_id) do
+      %Issue{} = issue ->
+        trimmed = String.trim(body)
+
+        if trimmed == "" do
+          {:noreply, put_flash(socket, :error, "Comment cannot be empty.")}
+        else
+          submit_ticket_comment(socket, issue, trimmed)
+        end
+
+      _ ->
+        {:noreply, put_flash(socket, :error, "Ticket not found in the current dashboard snapshot.")}
+    end
+  end
+
+  def handle_event("submit_ticket_comment", _params, socket), do: {:noreply, socket}
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -170,7 +272,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </p>
         </section>
 
-        <section class="section-card">
+        <section class="section-card section-running">
           <div class="section-header">
             <div>
               <h2 class="section-title">Running sessions</h2>
@@ -218,7 +320,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <%= if entry.session_id do %>
                           <button
                             type="button"
-                            class="subtle-button"
+                            class="subtle-button session-action-button"
                             data-label="Copy ID"
                             data-copy={entry.session_id}
                             onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
@@ -232,7 +334,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <button
                           :if={entry.event_stream_id}
                           type="button"
-                          class="subtle-button"
+                          class="subtle-button session-action-button"
                           phx-click="open_activity"
                           phx-value-stream_id={entry.event_stream_id}
                           phx-value-issue_identifier={entry.issue_identifier}
@@ -241,8 +343,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         </button>
                       </div>
                     </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
+                    <td class="numeric table-cell-small"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
+                    <td class="table-cell-small">
                       <div class="detail-stack">
                         <span
                           class="event-text"
@@ -256,7 +358,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         </span>
                       </div>
                     </td>
-                    <td>
+                    <td class="table-cell-small">
                       <div class="token-stack numeric">
                         <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                         <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
@@ -269,7 +371,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <% end %>
         </section>
 
-        <section class="section-card">
+        <section class="section-card section-retry">
           <div class="section-header">
             <div>
               <h2 class="section-title">Retry queue</h2>
@@ -307,7 +409,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <% end %>
         </section>
 
-        <section class="section-card">
+        <section class="section-card section-rate-limits">
           <div class="section-header">
             <div>
               <h2 class="section-title">Rate limits</h2>
@@ -317,7 +419,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <pre class="code-panel code-panel-plain"><%= pretty_value(@payload.rate_limits) %></pre>
         </section>
 
-        <section class="section-card">
+        <section class="section-card section-project-tickets">
           <div class="section-header">
             <div>
               <h2 class="section-title">
@@ -343,58 +445,173 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="empty-state">No project tickets found.</p>
           <% else %>
             <div class="table-wrap">
-              <table class="data-table" style="min-width: 860px;">
+              <table class="data-table" style="min-width: 1060px;">
                 <thead>
                   <tr>
                     <th>Issue</th>
                     <th>State</th>
                     <th>Updated</th>
                     <th>Linear</th>
+                    <th>Resource</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   <%= for {state_name, entries} <- grouped_project_tickets(@project_tickets) do %>
                     <tr>
-                      <td colspan="4">
+                      <td colspan="6">
                         <span class={state_badge_class(state_name)}><%= state_name %></span>
                       </td>
                     </tr>
 
-                    <tr :for={entry <- entries}>
-                      <td>
-                        <div class="detail-stack">
-                          <span class="issue-id"><%= project_ticket_identifier(entry) %></span>
+                    <%= for entry <- entries do %>
+                      <tr>
+                        <td>
+                          <div class="detail-stack">
+                            <span class="issue-id"><%= project_ticket_identifier(entry) %></span>
+                            <a
+                              :if={project_ticket_url(entry)}
+                              class="issue-link"
+                              href={project_ticket_url(entry)}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              <%= project_ticket_title(entry) %>
+                            </a>
+                            <span :if={!project_ticket_url(entry)} class="muted"><%= project_ticket_title(entry) %></span>
+                          </div>
+                        </td>
+                        <td>
+                          <%= if project_ticket_editable?(entry) do %>
+                            <button
+                              type="button"
+                              class={"ticket-status-button " <> state_badge_class(project_ticket_state(entry))}
+                              phx-click="open_ticket_status_editor"
+                              phx-value-issue_id={project_ticket_id(entry)}
+                              phx-value-current_state={project_ticket_state(entry)}
+                            >
+                              <%= project_ticket_state(entry) %>
+                            </button>
+                          <% else %>
+                            <span class={state_badge_class(project_ticket_state(entry))}>
+                              <%= project_ticket_state(entry) %>
+                            </span>
+                          <% end %>
+                        </td>
+                        <td class="mono numeric project-updated-small"><%= format_project_ticket_updated_at(project_ticket_updated_at(entry)) %></td>
+                        <td>
                           <a
                             :if={project_ticket_url(entry)}
-                            class="issue-link"
+                            class="issue-link project-link-action"
                             href={project_ticket_url(entry)}
                             target="_blank"
                             rel="noreferrer"
                           >
-                            <%= project_ticket_title(entry) %>
+                            Open
                           </a>
-                          <span :if={!project_ticket_url(entry)} class="muted"><%= project_ticket_title(entry) %></span>
-                        </div>
-                      </td>
-                      <td>
-                        <span class={state_badge_class(project_ticket_state(entry))}>
-                          <%= project_ticket_state(entry) %>
-                        </span>
-                      </td>
-                      <td class="mono numeric"><%= format_project_ticket_updated_at(project_ticket_updated_at(entry)) %></td>
-                      <td>
-                        <a
-                          :if={project_ticket_url(entry)}
-                          class="issue-link"
-                          href={project_ticket_url(entry)}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Open
-                        </a>
-                        <span :if={!project_ticket_url(entry)} class="muted">n/a</span>
-                      </td>
-                    </tr>
+                          <span :if={!project_ticket_url(entry)} class="muted project-link-action">n/a</span>
+                        </td>
+                        <td>
+                          <a
+                            :if={project_ticket_latest_resource_url(entry)}
+                            class="issue-link project-link-action"
+                            href={project_ticket_latest_resource_url(entry)}
+                            title={project_ticket_latest_resource_title(entry)}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Resource
+                          </a>
+                          <span :if={!project_ticket_latest_resource_url(entry)} class="muted project-link-action">n/a</span>
+                        </td>
+                        <td>
+                          <%= if project_ticket_editable?(entry) do %>
+                            <button
+                              type="button"
+                              class="subtle-button"
+                              phx-click="open_ticket_comment_editor"
+                              phx-value-issue_id={project_ticket_id(entry)}
+                            >
+                              Comment
+                            </button>
+                          <% else %>
+                            <span class="muted">n/a</span>
+                          <% end %>
+                        </td>
+                      </tr>
+                      <tr
+                        :if={ticket_editor_open?(@ticket_editor, project_ticket_id(entry), "status")}
+                        class="ticket-editor-row"
+                      >
+                        <td colspan="6">
+                          <form
+                            class="ticket-editor-popover"
+                            phx-change="ticket_status_change"
+                            phx-submit="submit_ticket_status"
+                          >
+                            <input type="hidden" name="issue_id" value={project_ticket_id(entry)} />
+                            <div class="ticket-editor-body ticket-editor-body-inline">
+                              <label class="ticket-editor-label" for={"ticket-status-" <> project_ticket_id(entry)}>
+                                Status
+                              </label>
+                              <select
+                                id={"ticket-status-" <> project_ticket_id(entry)}
+                                class="ticket-editor-input ticket-editor-select"
+                                name="status"
+                              >
+                                <option value="">Select status</option>
+                                <option
+                                  :for={status <- @ticket_status_options}
+                                  value={status}
+                                  selected={status == ticket_status_draft(@ticket_status_drafts, project_ticket_id(entry), project_ticket_state(entry))}
+                                >
+                                  <%= status %>
+                                </option>
+                              </select>
+                              <div class="ticket-editor-actions">
+                                <button type="submit">Save</button>
+                                <button type="button" class="secondary" phx-click="close_ticket_editor">
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </form>
+                        </td>
+                      </tr>
+                      <tr
+                        :if={ticket_editor_open?(@ticket_editor, project_ticket_id(entry), "comment")}
+                        class="ticket-editor-row"
+                      >
+                        <td colspan="6">
+                          <form
+                            class="ticket-editor-popover"
+                            phx-change="ticket_comment_change"
+                            phx-submit="submit_ticket_comment"
+                          >
+                            <input type="hidden" name="issue_id" value={project_ticket_id(entry)} />
+                            <div class="ticket-editor-body ticket-editor-body-inline">
+                              <label class="ticket-editor-label" for={"ticket-comment-" <> project_ticket_id(entry)}>
+                                Comment
+                              </label>
+                              <input
+                                type="text"
+                                id={"ticket-comment-" <> project_ticket_id(entry)}
+                                class="ticket-editor-input ticket-editor-comment-input"
+                                name="comment_body"
+                                placeholder="Write a short update..."
+                                value={ticket_comment_draft(@ticket_comment_drafts, project_ticket_id(entry), "")}
+                              />
+                              <div class="ticket-editor-actions">
+                                <button type="submit">Post</button>
+                                <button type="button" class="secondary" phx-click="close_ticket_editor">
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </form>
+                        </td>
+                      </tr>
+                    <% end %>
                   <% end %>
                 </tbody>
               </table>
@@ -402,11 +619,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <% end %>
         </section>
 
-        <section class="section-card">
+        <section class="section-card section-inactive">
           <div class="section-header">
             <div>
               <h2 class="section-title">Inactive sessions</h2>
-              <p class="section-copy">Most recent completed or stopped sessions for this runtime.</p>
             </div>
           </div>
 
@@ -455,7 +671,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <%= if entry.session_id do %>
                           <button
                             type="button"
-                            class="subtle-button"
+                            class="subtle-button session-action-button"
                             data-label="Copy ID"
                             data-copy={entry.session_id}
                             onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
@@ -469,7 +685,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <button
                           :if={entry.event_stream_id}
                           type="button"
-                          class="subtle-button"
+                          class="subtle-button session-action-button"
                           phx-click="open_activity"
                           phx-value-stream_id={entry.event_stream_id}
                           phx-value-issue_identifier={entry.issue_identifier || entry.issue_id || "unknown issue"}
@@ -478,11 +694,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         </button>
                       </div>
                     </td>
-                    <td class="numeric">
+                    <td class="numeric table-cell-small">
                       <%= format_inactive_runtime_and_turns(entry.runtime_seconds, entry.turn_count) %>
                     </td>
-                    <td class="mono numeric"><%= entry.ended_at || "n/a" %></td>
-                    <td>
+                    <td class="mono numeric table-cell-small"><%= entry.ended_at || "n/a" %></td>
+                    <td class="table-cell-small">
                       <div class="detail-stack">
                         <span class="event-text" title={format_stop_reason(entry.stop_reason)}>
                           <%= format_stop_reason(entry.stop_reason) %>
@@ -492,7 +708,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         </span>
                       </div>
                     </td>
-                    <td>
+                    <td class="table-cell-small">
                       <div class="token-stack numeric">
                         <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                         <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
@@ -728,6 +944,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     normalized = state |> to_string() |> String.downcase()
 
     cond do
+      String.contains?(normalized, "human review") -> "#{base} state-badge-active"
       String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
       String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
@@ -853,8 +1070,26 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp project_ticket_state(_issue), do: "Unknown"
 
+  defp project_ticket_id(%Issue{id: id}) when is_binary(id) and id != "", do: id
+  defp project_ticket_id(_issue), do: nil
+
+  defp project_ticket_editable?(%Issue{} = issue), do: is_binary(project_ticket_id(issue))
+  defp project_ticket_editable?(_issue), do: false
+
   defp project_ticket_url(%Issue{url: url}) when is_binary(url) and url != "", do: url
   defp project_ticket_url(_issue), do: nil
+
+  defp project_ticket_latest_resource_url(%Issue{latest_resource_url: url})
+       when is_binary(url) and url != "",
+       do: url
+
+  defp project_ticket_latest_resource_url(_issue), do: nil
+
+  defp project_ticket_latest_resource_title(%Issue{latest_resource_title: title})
+       when is_binary(title) and title != "",
+       do: title
+
+  defp project_ticket_latest_resource_title(_issue), do: "Latest resource"
 
   defp project_ticket_updated_at(%Issue{updated_at: %DateTime{} = updated_at}), do: updated_at
   defp project_ticket_updated_at(_issue), do: nil
@@ -866,6 +1101,103 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_project_tickets_error(reason) do
     "Project tickets refresh failed: #{inspect(reason)}"
+  end
+
+  defp find_project_ticket(tickets, issue_id) when is_list(tickets) and is_binary(issue_id) do
+    Enum.find(tickets, fn
+      %Issue{id: ^issue_id} -> true
+      _ -> false
+    end)
+  end
+
+  defp find_project_ticket(_tickets, _issue_id), do: nil
+
+  defp submit_ticket_status_update(socket, %Issue{} = issue, status) do
+    case issue_state_updater().(issue.id, status) do
+      :ok ->
+        {:noreply,
+         socket
+         |> assign(:ticket_editor, nil)
+         |> refresh_project_tickets()
+         |> put_flash(:info, "Updated #{project_ticket_identifier(issue)} to #{status}.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Failed to update status: #{inspect(reason)}")}
+    end
+  end
+
+  defp submit_ticket_comment(socket, %Issue{} = issue, body) do
+    case issue_comment_creator().(issue.id, body) do
+      :ok ->
+        {:noreply,
+         socket
+         |> assign(:ticket_editor, nil)
+         |> put_ticket_comment_draft(issue.id, "")
+         |> refresh_project_tickets()
+         |> put_flash(:info, "Added comment to #{project_ticket_identifier(issue)}.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Failed to add comment: #{inspect(reason)}")}
+    end
+  end
+
+  defp ticket_editor_open?(%{issue_id: issue_id, mode: mode}, issue_id, mode), do: true
+  defp ticket_editor_open?(_editor, _issue_id, _mode), do: false
+
+  defp ticket_status_draft(drafts, issue_id, fallback)
+       when is_map(drafts) and is_binary(issue_id) and is_binary(fallback) do
+    Map.get(drafts, issue_id, fallback)
+  end
+
+  defp ticket_status_draft(_drafts, _issue_id, fallback) when is_binary(fallback), do: fallback
+  defp ticket_status_draft(_drafts, _issue_id, _fallback), do: ""
+
+  defp ticket_comment_draft(drafts, issue_id, fallback)
+       when is_map(drafts) and is_binary(issue_id) and is_binary(fallback) do
+    Map.get(drafts, issue_id, fallback)
+  end
+
+  defp ticket_comment_draft(_drafts, _issue_id, fallback) when is_binary(fallback), do: fallback
+  defp ticket_comment_draft(_drafts, _issue_id, _fallback), do: ""
+
+  defp put_ticket_status_draft(socket, issue_id, status)
+       when is_binary(issue_id) and is_binary(status) do
+    current = socket.assigns.ticket_status_drafts || %{}
+    assign(socket, :ticket_status_drafts, Map.put(current, issue_id, status))
+  end
+
+  defp put_ticket_comment_draft(socket, issue_id, body)
+       when is_binary(issue_id) and is_binary(body) do
+    current = socket.assigns.ticket_comment_drafts || %{}
+    assign(socket, :ticket_comment_drafts, Map.put(current, issue_id, body))
+  end
+
+  defp valid_ticket_status?(allowed_statuses, status)
+       when is_list(allowed_statuses) and is_binary(status) do
+    normalized = String.downcase(status)
+    Enum.any?(allowed_statuses, &(String.downcase(&1) == normalized))
+  end
+
+  defp valid_ticket_status?(_allowed_statuses, _status), do: false
+
+  defp normalize_status_draft(value) when is_binary(value), do: String.trim(value)
+  defp normalize_status_draft(_value), do: ""
+
+  defp ticket_status_options do
+    ["Backlog"] ++
+      Config.linear_active_states() ++ ["Human Review", "Merging", "Rework"] ++ Config.linear_terminal_states()
+    |> Enum.map(&normalize_status_draft/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.reduce({MapSet.new(), []}, fn status, {seen, acc} ->
+      key = String.downcase(status)
+
+      if MapSet.member?(seen, key) do
+        {seen, acc}
+      else
+        {MapSet.put(seen, key), acc ++ [status]}
+      end
+    end)
+    |> elem(1)
   end
 
   defp linear_project_issues_url do
@@ -880,6 +1212,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp project_tickets_fetcher do
     Endpoint.config(:project_tickets_fetcher) || &Tracker.fetch_project_issues/1
+  end
+
+  defp issue_state_updater do
+    Endpoint.config(:issue_state_updater) || &Tracker.update_issue_state/2
+  end
+
+  defp issue_comment_creator do
+    Endpoint.config(:issue_comment_creator) || &Tracker.create_comment/2
   end
 
   defp maybe_refresh_activity_drawer(socket) do

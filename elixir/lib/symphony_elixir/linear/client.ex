@@ -43,6 +43,13 @@ defmodule SymphonyElixir.Linear.Client do
             }
           }
         }
+        attachments(first: $relationFirst) {
+          nodes {
+            title
+            url
+            createdAt
+          }
+        }
         createdAt
         updatedAt
       }
@@ -86,6 +93,13 @@ defmodule SymphonyElixir.Linear.Client do
                 name
               }
             }
+          }
+        }
+        attachments(first: $relationFirst) {
+          nodes {
+            title
+            url
+            createdAt
           }
         }
         createdAt
@@ -499,6 +513,8 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_issue(issue, assignee_filter) when is_map(issue) do
     assignee = issue["assignee"]
+    {latest_resource_url, latest_resource_title, latest_resource_added_at} =
+      extract_latest_resource(issue)
 
     %Issue{
       id: issue["id"],
@@ -509,6 +525,9 @@ defmodule SymphonyElixir.Linear.Client do
       state: get_in(issue, ["state", "name"]),
       branch_name: issue["branchName"],
       url: issue["url"],
+      latest_resource_url: latest_resource_url,
+      latest_resource_title: latest_resource_title,
+      latest_resource_added_at: latest_resource_added_at,
       assignee_id: assignee_field(assignee, "id"),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
@@ -589,6 +608,31 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_assignee_match_value(_value), do: nil
+
+  defp extract_latest_resource(%{"attachments" => %{"nodes" => attachments}})
+       when is_list(attachments) do
+    attachments
+    |> Enum.map(fn
+      %{"url" => url} = attachment when is_binary(url) and url != "" ->
+        {url, attachment["title"], parse_datetime(attachment["createdAt"])}
+
+      _ ->
+        nil
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort_by(fn {_url, _title, added_at} ->
+      case added_at do
+        %DateTime{} = value -> DateTime.to_unix(value, :microsecond)
+        _ -> -1
+      end
+    end, :desc)
+    |> case do
+      [{url, title, added_at} | _] -> {url, title, added_at}
+      _ -> {nil, nil, nil}
+    end
+  end
+
+  defp extract_latest_resource(_issue), do: {nil, nil, nil}
 
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels

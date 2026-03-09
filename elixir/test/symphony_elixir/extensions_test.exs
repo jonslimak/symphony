@@ -770,6 +770,8 @@ defmodule SymphonyElixir.ExtensionsTest do
         title: "Newer todo item",
         state: "Todo",
         url: "https://linear.app/example/issue/MT-100",
+        latest_resource_title: "Latest PR",
+        latest_resource_url: "https://github.com/jonslimak/sym-pilot/pull/999",
         updated_at: ~U[2026-01-01 11:00:00Z]
       }
     ]
@@ -809,6 +811,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-100"
     assert html =~ "MT-200"
     assert html =~ "https://linear.app/example/issue/MT-100"
+    assert html =~ "https://github.com/jonslimak/sym-pilot/pull/999"
     assert html_index!(html, "Rate limits") < html_index!(html, "Project tickets")
     assert html_index!(html, "Backlog") < html_index!(html, "Todo")
     assert html_index!(html, "MT-100") < html_index!(html, "MT-200")
@@ -824,6 +827,139 @@ defmodule SymphonyElixir.ExtensionsTest do
         refreshed =~ "MT-100" and
         refreshed =~ "MT-200"
     end)
+  end
+
+  test "dashboard liveview updates ticket status and adds ticket comments from project ticket rows" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    orchestrator_name = Module.concat(__MODULE__, :ProjectTicketActionsOrchestrator)
+    snapshot = static_snapshot()
+
+    project_tickets = [
+      %Issue{
+        id: "issue-100",
+        identifier: "MT-100",
+        title: "Editable ticket",
+        state: "Todo",
+        url: "https://linear.app/example/issue/MT-100",
+        updated_at: ~U[2026-01-01 11:00:00Z]
+      }
+    ]
+
+    fetcher = fn _limit -> {:ok, project_tickets} end
+
+    {:ok, _orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        session_events: static_session_events()
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      project_tickets_fetcher: fetcher
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Project tickets"
+
+    view
+    |> element("button[phx-click='open_ticket_status_editor'][phx-value-issue_id='issue-100']")
+    |> render_click()
+
+    assert has_element?(view, "form[phx-submit='submit_ticket_status'] select[name='status']")
+
+    view
+    |> element("form[phx-submit='submit_ticket_status']")
+    |> render_submit(%{"issue_id" => "issue-100", "status" => "Done"})
+
+    assert_receive {:memory_tracker_state_update, "issue-100", "Done"}
+
+    view
+    |> element("button[phx-click='open_ticket_comment_editor'][phx-value-issue_id='issue-100']")
+    |> render_click()
+
+    assert has_element?(view, "form[phx-submit='submit_ticket_comment'] input[name='comment_body']")
+
+    view
+    |> element("form[phx-submit='submit_ticket_comment']")
+    |> render_submit(%{"issue_id" => "issue-100", "comment_body" => "Looks good"})
+
+    assert_receive {:memory_tracker_comment, "issue-100", "Looks good"}
+  end
+
+  test "dashboard liveview validates ticket actions and surfaces mutation errors inline" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    orchestrator_name = Module.concat(__MODULE__, :ProjectTicketActionErrorsOrchestrator)
+    snapshot = static_snapshot()
+
+    project_tickets = [
+      %Issue{
+        id: "issue-100",
+        identifier: "MT-100",
+        title: "Editable ticket",
+        state: "Todo",
+        url: "https://linear.app/example/issue/MT-100",
+        updated_at: ~U[2026-01-01 11:00:00Z]
+      }
+    ]
+
+    fetcher = fn _limit -> {:ok, project_tickets} end
+
+    {:ok, _orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        session_events: static_session_events()
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      project_tickets_fetcher: fetcher,
+      issue_state_updater: fn _issue_id, _status -> {:error, :boom} end,
+      issue_comment_creator: fn _issue_id, _body -> {:error, :comment_boom} end
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    view
+    |> element("button[phx-click='open_ticket_status_editor'][phx-value-issue_id='issue-100']")
+    |> render_click()
+
+    view
+    |> element("form[phx-submit='submit_ticket_status']")
+    |> render_submit(%{"issue_id" => "issue-100", "status" => "NotARealState"})
+
+    assert has_element?(view, "form[phx-submit='submit_ticket_status'] select[name='status']")
+    refute_received {:memory_tracker_state_update, "issue-100", _state}
+
+    view
+    |> element("form[phx-submit='submit_ticket_status']")
+    |> render_submit(%{"issue_id" => "issue-100", "status" => "Done"})
+
+    assert has_element?(view, "form[phx-submit='submit_ticket_status'] select[name='status']")
+
+    view
+    |> element("button[phx-click='open_ticket_comment_editor'][phx-value-issue_id='issue-100']")
+    |> render_click()
+
+    view
+    |> element("form[phx-submit='submit_ticket_comment']")
+    |> render_submit(%{"issue_id" => "issue-100", "comment_body" => "   "})
+
+    assert has_element?(view, "form[phx-submit='submit_ticket_comment'] input[name='comment_body']")
+    refute_received {:memory_tracker_comment, "issue-100", _body}
+
+    view
+    |> element("form[phx-submit='submit_ticket_comment']")
+    |> render_submit(%{"issue_id" => "issue-100", "comment_body" => "retry comment"})
+
+    assert has_element?(view, "form[phx-submit='submit_ticket_comment'] input[name='comment_body']")
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
