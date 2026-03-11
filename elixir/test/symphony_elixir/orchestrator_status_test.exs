@@ -224,6 +224,84 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              Orchestrator.session_events(orchestrator_name, "missing-stream", 10, 1_000)
   end
 
+  test "orchestrator session events persist malformed details for session debugging" do
+    issue_id = "issue-malformed-session-events"
+    stream_id = "mt-303-session-#{System.unique_integer([:positive])}"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-303",
+      title: "Malformed session events test",
+      description: "Persist malformed session detail",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-303"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :MalformedSessionEventsOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    now = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      event_stream_id: stream_id,
+      session_id: "thread-malformed-turn-1",
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: now
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:timeline_events, %{stream_id => []})
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :malformed,
+         details: %{
+           stream_label: "turn stream",
+           raw_preview: "warning: malformed turn noise",
+           raw_bytes: 29,
+           thread_id: "thread-malformed",
+           turn_id: "turn-1"
+         },
+         payload: "warning: malformed turn noise",
+         timestamp: now
+       }}
+    )
+
+    assert {:ok, [event]} = Orchestrator.session_events(orchestrator_name, stream_id, 10, 1_000)
+    assert (event[:event] || event["event"]) == "malformed"
+    assert (event[:kind] || event["kind"]) == "stream_error"
+    assert (event[:category] || event["category"]) == "codex"
+    assert (event[:action] || event["action"]) == "malformed_event"
+
+    assert (event[:details] || event["details"]) == %{
+             "stream_label" => "turn stream",
+             "raw_preview" => "warning: malformed turn noise",
+             "raw_bytes" => 29,
+             "thread_id" => "thread-malformed",
+             "turn_id" => "turn-1"
+           }
+  end
+
   test "session events reads persisted history for active sessions beyond in-memory window" do
     issue_id = "issue-persisted-session-events"
     stream_id = "mt-persisted-session"
@@ -1857,6 +1935,267 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert StatusDashboard.humanize_codex_message(fallback_reasoning) == "reasoning update"
   end
 
+  test "orchestrator suppresses spawned child dispatch from successful issueCreate tool completions" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    parent_issue = %Issue{
+      id: "issue-parent-spawn",
+      identifier: "MT-401",
+      title: "Parent spawn issue",
+      description: "Suppress spawned child dispatch",
+      state: "Agent Review",
+      url: "https://example.org/issues/MT-401"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :SpawnSuppressionOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: parent_issue.identifier,
+      issue: parent_issue,
+      session_id: "thread-parent-turn-1",
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{parent_issue.id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, parent_issue.id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, parent_issue.id,
+       %{
+         event: :tool_call_completed,
+         payload: %{
+           "method" => "item/tool/call",
+           "params" => %{
+             "tool" => "linear_graphql",
+             "arguments" => %{
+               "query" => "mutation CreateChild($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id } } }",
+               "variables" => %{"input" => %{"teamId" => "team-1"}}
+             }
+           }
+         },
+         result: %{
+           "success" => true,
+           "contentItems" => [
+             %{
+               "type" => "inputText",
+               "text" => ~s({"data":{"issueCreate":{"success":true,"issue":{"id":"child-issue-401"}}}})
+             }
+           ]
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    state =
+      wait_for_state(pid, fn state ->
+        state.suppressed_dispatch == %{
+          "child-issue-401" => %{parent_issue_id: parent_issue.id}
+        }
+      end)
+
+    assert state.suppressed_dispatch == %{
+             "child-issue-401" => %{parent_issue_id: parent_issue.id}
+           }
+  end
+
+  test "orchestrator classifies and suppresses rollout-shaped issueCreate tool completions" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    parent_issue = %Issue{
+      id: "issue-parent-rollout-spawn",
+      identifier: "MT-401B",
+      title: "Parent rollout spawn issue",
+      description: "Suppress spawned child dispatch from rollout-shaped payloads",
+      state: "Agent Review",
+      url: "https://example.org/issues/MT-401B"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RolloutSpawnSuppressionOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    stream_id = "mt-401b-stream"
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: parent_issue.identifier,
+      issue: parent_issue,
+      event_stream_id: stream_id,
+      session_id: "thread-parent-turn-rollout",
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{parent_issue.id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, parent_issue.id))
+      |> Map.put(:timeline_events, %{stream_id => []})
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, parent_issue.id,
+       %{
+         event: :tool_call_completed,
+         payload: %{
+           "type" => "function_call",
+           "name" => "linear_graphql",
+           "arguments" =>
+             ~s|{"query":"mutation CreateChild($input: IssueCreateInput!) {\\n  issueCreate(input: $input) {\\n    success\\n    issue {\\n      id\\n      identifier\\n      title\\n      state { name }\\n      url\\n    }\\n  }\\n}","variables":{"input":{"teamId":"team-1","stateId":"state-todo","title":"Create poster image from MT-401B haiku artifact"}}}|,
+         },
+         result: %{
+           "output" => [
+             %{
+               "type" => "input_text",
+               "text" =>
+                 ~s({"data":{"issueCreate":{"issue":{"id":"child-issue-401b","identifier":"MT-401C","state":{"name":"Todo"},"title":"Create poster image from MT-401B haiku artifact","url":"https://example.org/issues/MT-401C"},"success":true}}})
+             }
+           ]
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    state =
+      wait_for_state(pid, fn state ->
+        state.suppressed_dispatch == %{
+          "child-issue-401b" => %{parent_issue_id: parent_issue.id}
+        }
+      end)
+
+    assert state.suppressed_dispatch == %{
+             "child-issue-401b" => %{parent_issue_id: parent_issue.id}
+           }
+
+    assert Enum.any?(Map.get(state.timeline_events, stream_id, []), fn event ->
+             (event[:action] || event["action"]) == "linear_issue_create"
+           end)
+  end
+
+  test "suppressed todo child is not dispatchable and clears after leaving todo" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+    end)
+
+    child_issue = %Issue{
+      id: "child-issue-402",
+      identifier: "MT-402",
+      title: "Spawned child",
+      description: "Suppressed child ticket",
+      state: "Todo",
+      url: "https://example.org/issues/MT-402"
+    }
+
+    suppressed_state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      suppressed_dispatch: %{"child-issue-402" => %{parent_issue_id: "parent-402"}}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(child_issue, suppressed_state)
+    refute Orchestrator.retry_candidate_issue_for_test(child_issue, suppressed_state)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{child_issue | state: "In Progress"}])
+
+    reconciled_state = Orchestrator.reconcile_suppressed_dispatch_for_test(suppressed_state)
+
+    assert reconciled_state.suppressed_dispatch == %{}
+  end
+
+  test "suppression survives parent shutdown" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    parent_issue = %Issue{
+      id: "issue-parent-shutdown",
+      identifier: "MT-403",
+      title: "Parent shutdown issue",
+      description: "Suppression should survive parent completion",
+      state: "Agent Review",
+      url: "https://example.org/issues/MT-403"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :SuppressionSurvivesShutdownOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: parent_issue.identifier,
+      issue: parent_issue,
+      session_id: "thread-parent-turn-2",
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{parent_issue.id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, parent_issue.id))
+      |> Map.put(:suppressed_dispatch, %{"child-issue-403" => %{parent_issue_id: parent_issue.id}})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+
+    state =
+      wait_for_state(pid, fn state ->
+        state.running == %{} and
+          state.suppressed_dispatch == %{
+            "child-issue-403" => %{parent_issue_id: parent_issue.id}
+          }
+      end)
+
+    assert state.suppressed_dispatch == %{
+             "child-issue-403" => %{parent_issue_id: parent_issue.id}
+           }
+  end
+
   test "application stop renders offline status" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
@@ -1883,6 +2222,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       else
         Process.sleep(5)
         do_wait_for_snapshot(pid, predicate, deadline_ms)
+      end
+    end
+  end
+
+  defp wait_for_state(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for_state(pid, predicate, deadline_ms)
+  end
+
+  defp do_wait_for_state(pid, predicate, deadline_ms) do
+    state = :sys.get_state(pid)
+
+    if predicate.(state) do
+      state
+    else
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        flunk("timed out waiting for orchestrator state: #{inspect(state)}")
+      else
+        Process.sleep(5)
+        do_wait_for_state(pid, predicate, deadline_ms)
       end
     end
   end

@@ -88,6 +88,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
+
+        stream_context = %{
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          thread_id: thread_id,
+          turn_id: turn_id,
+          session_id: session_id
+        }
+
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
         emit_message(
@@ -101,7 +110,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, stream_context) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -239,7 +248,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    case await_response(port, @thread_start_id) do
+    case await_response(port, @thread_start_id, %{request_name: "thread/start", workspace: Path.expand(workspace)}) do
       {:ok, %{"thread" => thread_payload}} ->
         case thread_payload do
           %{"id" => thread_id} -> {:ok, thread_id}
@@ -270,21 +279,26 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    case await_response(port, @turn_start_id) do
+    case await_response(port, @turn_start_id, %{
+           request_name: "turn/start",
+           issue_id: issue.id,
+           issue_identifier: issue.identifier,
+           thread_id: thread_id
+         }) do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
       other -> other
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
-    receive_loop(port, on_message, Config.codex_turn_timeout_ms(), "", tool_executor, auto_approve_requests)
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, context) do
+    receive_loop(port, on_message, Config.codex_turn_timeout_ms(), "", tool_executor, auto_approve_requests, context)
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, context) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, context)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -293,7 +307,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          context
         )
 
       {^port, {:exit_status, status}} ->
@@ -304,7 +319,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, context) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -346,7 +361,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          context
         )
 
       {:ok, payload} ->
@@ -360,22 +376,24 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, context)
 
       {:error, _reason} ->
-        log_non_json_stream_line(payload_string, "turn stream")
+        malformed_details = malformed_stream_details(payload_string, "turn stream", context)
+        log_non_json_stream_line(payload_string, "turn stream", context)
 
         emit_message(
           on_message,
           :malformed,
           %{
             payload: payload_string,
-            raw: payload_string
+            raw: payload_string,
+            details: malformed_details
           },
           metadata_from_message(port, %{raw: payload_string})
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, context)
     end
   end
 
@@ -400,7 +418,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         context
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -425,7 +444,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, context)
 
       :approval_required ->
         emit_message(
@@ -459,7 +478,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, context)
         end
     end
   end
@@ -513,7 +532,12 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ -> :tool_call_failed
       end
 
-    emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
+    emit_message(
+      on_message,
+      event,
+      %{payload: payload, raw: payload_string, result: result},
+      metadata
+    )
 
     :approved
   end
@@ -820,17 +844,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.codex_read_timeout_ms(), "")
+    await_response(port, request_id, %{})
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+  defp await_response(port, request_id, context) do
+    with_timeout_response(port, request_id, Config.codex_read_timeout_ms(), "", context)
+  end
+
+  defp with_timeout_response(port, request_id, timeout_ms, pending_line, context) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+        handle_response(port, request_id, complete_line, timeout_ms, context)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk), context)
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
@@ -840,7 +868,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp handle_response(port, request_id, data, timeout_ms, context) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
@@ -855,28 +883,74 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        with_timeout_response(port, request_id, timeout_ms, "", context)
 
       {:error, _} ->
-        log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        response_context = Map.merge(%{request_id: request_id}, context)
+        log_non_json_stream_line(payload, "response stream", response_context)
+        with_timeout_response(port, request_id, timeout_ms, "", context)
     end
   end
 
-  defp log_non_json_stream_line(data, stream_label) do
-    text =
-      data
-      |> to_string()
-      |> String.trim()
-      |> String.slice(0, @max_stream_log_bytes)
+  defp log_non_json_stream_line(data, stream_label, context) do
+    raw_text = to_string(data)
+    text = malformed_preview(raw_text)
 
     if text != "" do
+      details =
+        context
+        |> stream_log_context()
+        |> case do
+          "" -> "bytes=#{byte_size(raw_text)}"
+          context_text -> "#{context_text} bytes=#{byte_size(raw_text)}"
+        end
+
+      message = "Codex #{stream_label} output #{details}: #{text}"
+
       if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
-        Logger.warning("Codex #{stream_label} output: #{text}")
+        Logger.warning(message)
       else
-        Logger.debug("Codex #{stream_label} output: #{text}")
+        Logger.debug(message)
       end
     end
+  end
+
+  defp malformed_stream_details(data, stream_label, context) do
+    raw_text = to_string(data)
+    preview = malformed_preview(raw_text)
+
+    context_fields =
+      [:issue_id, :issue_identifier, :session_id, :thread_id, :turn_id, :request_name, :request_id]
+      |> Enum.reduce(%{}, fn key, acc ->
+        case Map.get(context, key) do
+          value when is_binary(value) and value != "" -> Map.put(acc, key, value)
+          value when is_integer(value) -> Map.put(acc, key, value)
+          _ -> acc
+        end
+      end)
+
+    context_fields
+    |> Map.put(:stream_label, stream_label)
+    |> Map.put(:raw_bytes, byte_size(raw_text))
+    |> Map.put(:raw_preview, preview)
+  end
+
+  defp malformed_preview(raw_text) do
+    raw_text
+    |> String.trim()
+    |> String.slice(0, @max_stream_log_bytes)
+  end
+
+  defp stream_log_context(context) when is_map(context) do
+    [:issue_id, :issue_identifier, :session_id, :thread_id, :turn_id, :request_name, :request_id, :workspace]
+    |> Enum.reduce([], fn key, acc ->
+      case Map.get(context, key) do
+        value when is_binary(value) and value != "" -> acc ++ ["#{key}=#{value}"]
+        value when is_integer(value) -> acc ++ ["#{key}=#{value}"]
+        _ -> acc
+      end
+    end)
+    |> Enum.join(" ")
   end
 
   defp issue_context(%{id: issue_id, identifier: identifier}) do

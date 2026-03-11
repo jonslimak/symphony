@@ -4,10 +4,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Tracker
 
   @linear_graphql_tool "linear_graphql"
+  @linear_attach_resource_tool "linear_attach_issue_resource"
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  """
+  @linear_attach_resource_description """
+  Attach a review resource URL to a Linear issue using Symphony's configured tracker integration.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -25,12 +30,34 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   }
+  @linear_attach_resource_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["issueId", "url"],
+    "properties" => %{
+      "issueId" => %{
+        "type" => "string",
+        "description" => "Linear issue id to attach the resource to."
+      },
+      "url" => %{
+        "type" => "string",
+        "description" => "Resource URL to attach, such as a GitHub pull request URL."
+      },
+      "title" => %{
+        "type" => ["string", "null"],
+        "description" => "Optional attachment title override."
+      }
+    }
+  }
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
+
+      @linear_attach_resource_tool ->
+        execute_linear_attach_resource(arguments, opts)
 
       other ->
         failure_response(%{
@@ -49,6 +76,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
+      },
+      %{
+        "name" => @linear_attach_resource_tool,
+        "description" => @linear_attach_resource_description,
+        "inputSchema" => @linear_attach_resource_input_schema
       }
     ]
   end
@@ -59,6 +91,32 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
          {:ok, response} <- linear_client.(query, variables, []) do
       graphql_response(response)
+    else
+      {:error, reason} ->
+        failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_linear_attach_resource(arguments, opts) do
+    attach_resource = Keyword.get(opts, :attach_resource, &Tracker.attach_issue_resource/3)
+
+    with {:ok, issue_id, url, title} <- normalize_linear_attach_resource_arguments(arguments),
+         :ok <- attach_resource.(issue_id, url, title) do
+      %{
+        "success" => true,
+        "contentItems" => [
+          %{
+            "type" => "inputText",
+            "text" =>
+              encode_payload(%{
+                "issueId" => issue_id,
+                "url" => url,
+                "title" => title,
+                "attached" => true
+              })
+          }
+        ]
+      }
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
@@ -89,6 +147,28 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp normalize_linear_graphql_arguments(_arguments), do: {:error, :invalid_arguments}
+
+  defp normalize_linear_attach_resource_arguments(arguments) when is_map(arguments) do
+    issue_id = Map.get(arguments, "issueId") || Map.get(arguments, :issueId)
+    url = Map.get(arguments, "url") || Map.get(arguments, :url)
+    title = Map.get(arguments, "title") || Map.get(arguments, :title)
+
+    cond do
+      not (is_binary(issue_id) and String.trim(issue_id) != "") ->
+        {:error, :missing_issue_id}
+
+      not (is_binary(url) and String.trim(url) != "") ->
+        {:error, :missing_url}
+
+      not (is_nil(title) or is_binary(title)) ->
+        {:error, :invalid_title}
+
+      true ->
+        {:ok, String.trim(issue_id), String.trim(url), title}
+    end
+  end
+
+  defp normalize_linear_attach_resource_arguments(_arguments), do: {:error, :invalid_arguments}
 
   defp normalize_query(arguments) do
     case Map.get(arguments, "query") || Map.get(arguments, :query) do
@@ -155,10 +235,35 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload(:missing_issue_id) do
+    %{
+      "error" => %{
+        "message" => "`linear_attach_issue_resource` requires a non-empty `issueId` string."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_url) do
+    %{
+      "error" => %{
+        "message" => "`linear_attach_issue_resource` requires a non-empty `url` string."
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_title) do
+    %{
+      "error" => %{
+        "message" => "`linear_attach_issue_resource.title` must be a string when provided."
+      }
+    }
+  end
+
   defp tool_error_payload(:invalid_arguments) do
     %{
       "error" => %{
-        "message" => "`linear_graphql` expects either a GraphQL query string or an object with `query` and optional `variables`."
+        "message" =>
+          "Tool arguments are invalid. `linear_graphql` expects a query payload; `linear_attach_issue_resource` expects `issueId`, `url`, and optional `title`."
       }
     }
   end
@@ -193,6 +298,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "error" => %{
         "message" => "Linear GraphQL request failed before receiving a successful response.",
         "reason" => inspect(reason)
+      }
+    }
+  end
+
+  defp tool_error_payload(:attachment_link_failed) do
+    %{
+      "error" => %{
+        "message" => "Linear issue attachment failed."
       }
     }
   end

@@ -212,12 +212,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
+    assert :ok = SymphonyElixir.Tracker.attach_issue_resource("issue-1", "https://example.com", "Example")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
+    assert_receive {:memory_tracker_resource_attach, "issue-1", "https://example.com", "Example"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
+    assert :ok = Memory.attach_issue_resource("issue-1", "https://example.com", nil)
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
@@ -338,6 +341,52 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"attachmentLinkGitHubPR" => %{"success" => true}}}}
+    )
+
+    assert :ok =
+             Adapter.attach_issue_resource(
+               "issue-1",
+               "https://github.com/openai/symphony/pull/18",
+               "PR 18"
+             )
+
+    assert_receive {:graphql_called, github_pr_query,
+                     %{
+                       issueId: "issue-1",
+                       title: "PR 18",
+                       url: "https://github.com/openai/symphony/pull/18"
+                     }}
+
+    assert github_pr_query =~ "attachmentLinkGitHubPR"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"attachmentLinkURL" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.attach_issue_resource("issue-1", "https://example.com/run/1", nil)
+
+    assert_receive {:graphql_called, url_query,
+                     %{issueId: "issue-1", title: nil, url: "https://example.com/run/1"}}
+
+    assert url_query =~ "attachmentLinkURL"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"attachmentLinkURL" => %{"success" => false}}}}
+    )
+
+    assert {:error, :attachment_link_failed} =
+             Adapter.attach_issue_resource("issue-1", "https://example.com/fail", nil)
+
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
+
+    assert {:error, :boom} =
+             Adapter.attach_issue_resource("issue-1", "https://example.com/boom", nil)
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do

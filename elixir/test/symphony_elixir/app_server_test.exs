@@ -284,14 +284,18 @@ defmodule SymphonyElixir.AppServerTest do
 
                  payload["id"] == 2 and
                    case get_in(payload, ["params", "dynamicTools"]) do
-                     [
-                       %{
-                         "description" => description,
-                         "inputSchema" => %{"required" => ["query"]},
-                         "name" => "linear_graphql"
-                       }
-                     ] ->
-                       description =~ "Linear"
+                     tools when is_list(tools) ->
+                       Enum.any?(tools, fn
+                         %{
+                           "description" => description,
+                           "inputSchema" => %{"required" => ["query"]},
+                           "name" => "linear_graphql"
+                         } ->
+                           description =~ "Linear"
+
+                         _ ->
+                           false
+                       end)
 
                      _ ->
                        false
@@ -786,12 +790,29 @@ defmodule SymphonyElixir.AppServerTest do
       end
 
       assert {:ok, _result} =
-               AppServer.run(workspace, "Handle supported tool calls", issue, tool_executor: tool_executor)
+               AppServer.run(workspace, "Handle supported tool calls", issue,
+                 on_message: fn message -> send(test_pid, {:app_server_message, message}) end,
+                 tool_executor: tool_executor
+               )
 
       assert_received {:tool_called, "linear_graphql",
                        %{
                          "query" => "query Viewer { viewer { id } }",
                          "variables" => %{"includeTeams" => false}
+                       }}
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :tool_call_completed,
+                         result: %{
+                           "success" => true,
+                           "contentItems" => [
+                             %{
+                               "type" => "inputText",
+                               "text" => ~s({"data":{"viewer":{"id":"usr_123"}}})
+                             }
+                           ]
+                         }
                        }}
 
       trace = File.read!(trace_file)
@@ -917,7 +938,20 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert_received {:tool_called, "linear_graphql", %{"query" => "query Viewer { viewer { id } }"}}
 
-      assert_received {:app_server_message, %{event: :tool_call_failed, payload: %{"params" => %{"tool" => "linear_graphql"}}}}
+      assert_received {:app_server_message,
+                       %{
+                         event: :tool_call_failed,
+                         payload: %{"params" => %{"tool" => "linear_graphql"}},
+                         result: %{
+                           "success" => false,
+                           "contentItems" => [
+                             %{
+                               "type" => "inputText",
+                               "text" => ~s({"error":{"message":"boom"}})
+                             }
+                           ]
+                         }
+                       }}
     after
       File.rm_rf(test_root)
     end
@@ -1050,7 +1084,238 @@ defmodule SymphonyElixir.AppServerTest do
           assert {:ok, _result} = AppServer.run(workspace, "Capture stderr log", issue)
         end)
 
-      assert log =~ "Codex turn stream output: warning: this is stderr noise"
+      assert log =~
+               "Codex turn stream output issue_id=issue-stderr issue_identifier=MT-92 session_id=thread-92-turn-92 thread_id=thread-92 turn_id=turn-92"
+
+      assert log =~ "bytes=29: warning: this is stderr noise"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server logs malformed response stream output with request context" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-response-stream-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-93")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-93"}}}'
+            ;;
+          3)
+            printf '%s\\n' 'warning: response stream noise'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-93"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-response-stream",
+        identifier: "MT-93",
+        title: "Capture response stream",
+        description: "Ensure malformed response lines include context",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-93",
+        labels: ["backend"]
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _result} = AppServer.run(workspace, "Capture response stream log", issue)
+        end)
+
+      assert log =~
+               "Codex response stream output issue_id=issue-response-stream issue_identifier=MT-93 thread_id=thread-93 request_name=turn/start request_id=3"
+
+      assert log =~ "bytes=30: warning: response stream noise"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server emits malformed turn-stream details with preview and context" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-malformed-details-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-93B")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-93b"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-93b"}}}'
+            ;;
+          4)
+            printf '%s\\n' 'warning: malformed turn noise'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-malformed-details",
+        identifier: "MT-93B",
+        title: "Capture malformed details",
+        description: "Ensure malformed turn stream emits details",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-93B",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Capture malformed details", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :malformed,
+                         details: %{
+                           issue_id: "issue-malformed-details",
+                           issue_identifier: "MT-93B",
+                           session_id: "thread-93b-turn-93b",
+                           thread_id: "thread-93b",
+                           turn_id: "turn-93b",
+                           stream_label: "turn stream",
+                           raw_bytes: 29,
+                           raw_preview: "warning: malformed turn noise"
+                         }
+                       }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server truncates long malformed stream previews" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-truncated-stream-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-94")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-94"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-94"}}}'
+            ;;
+          4)
+            printf 'warning:%sTAILMARKER\\n' "$(printf 'A%.0s' $(seq 1 1100))" >&2
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-truncated-stream",
+        identifier: "MT-94",
+        title: "Truncate malformed output",
+        description: "Ensure malformed stream previews stay bounded",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-94",
+        labels: ["backend"]
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _result} = AppServer.run(workspace, "Capture truncated stream log", issue)
+        end)
+
+      assert log =~
+               "Codex turn stream output issue_id=issue-truncated-stream issue_identifier=MT-94 session_id=thread-94-turn-94"
+
+      assert log =~ "bytes=1118: warning:AAAA"
+      refute log =~ "TAILMARKER"
     after
       File.rm_rf(test_root)
     end

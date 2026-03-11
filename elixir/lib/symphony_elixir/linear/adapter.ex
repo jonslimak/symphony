@@ -23,6 +23,22 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @attach_github_pr_mutation """
+  mutation SymphonyAttachGitHubPR($issueId: String!, $url: String!, $title: String) {
+    attachmentLinkGitHubPR(issueId: $issueId, url: $url, title: $title) {
+      success
+    }
+  }
+  """
+
+  @attach_url_mutation """
+  mutation SymphonyAttachURL($issueId: String!, $url: String!, $title: String) {
+    attachmentLinkURL(issueId: $issueId, url: $url, title: $title) {
+      success
+    }
+  }
+  """
+
   @state_lookup_query """
   query SymphonyResolveStateId($issueId: String!, $stateName: String!) {
     issue(id: $issueId) {
@@ -78,9 +94,46 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  @spec attach_issue_resource(String.t(), String.t(), String.t() | nil) :: :ok | {:error, term()}
+  def attach_issue_resource(issue_id, url, title \\ nil)
+      when is_binary(issue_id) and is_binary(url) do
+    {mutation, payload_key} = attachment_mutation(url)
+    variables = %{issueId: issue_id, url: url, title: normalize_optional_title(title)}
+
+    with {:ok, response} <- client_module().graphql(mutation, variables),
+         true <- get_in(response, ["data", payload_key, "success"]) == true do
+      :ok
+    else
+      false -> {:error, :attachment_link_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :attachment_link_failed}
+    end
+  end
+
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end
+
+  defp attachment_mutation(url) when is_binary(url) do
+    if github_pr_url?(url) do
+      {@attach_github_pr_mutation, "attachmentLinkGitHubPR"}
+    else
+      {@attach_url_mutation, "attachmentLinkURL"}
+    end
+  end
+
+  defp github_pr_url?(url) when is_binary(url) do
+    String.match?(url, ~r/^https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+(?:\/.*)?$/)
+  end
+
+  defp normalize_optional_title(title) when is_binary(title) do
+    case String.trim(title) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_optional_title(_title), do: nil
 
   defp resolve_state_id(issue_id, state_name) do
     with {:ok, response} <-

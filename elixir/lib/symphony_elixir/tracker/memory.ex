@@ -52,6 +52,12 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec attach_issue_resource(String.t(), String.t(), String.t() | nil) :: :ok | {:error, term()}
+  def attach_issue_resource(issue_id, url, title) do
+    send_event({:memory_tracker_resource_attach, issue_id, url, title})
+    :ok
+  end
+
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end

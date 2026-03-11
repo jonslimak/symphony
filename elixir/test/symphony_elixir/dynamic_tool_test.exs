@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
              %{
-               "description" => description,
+               "description" => graphql_description,
                "inputSchema" => %{
                  "properties" => %{
                    "query" => _,
@@ -16,10 +16,24 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                  "type" => "object"
                },
                "name" => "linear_graphql"
+             },
+             %{
+               "description" => attach_description,
+               "inputSchema" => %{
+                 "properties" => %{
+                   "issueId" => _,
+                   "title" => _,
+                   "url" => _
+                 },
+                 "required" => ["issueId", "url"],
+                 "type" => "object"
+               },
+               "name" => "linear_attach_issue_resource"
              }
            ] = DynamicTool.tool_specs()
 
-    assert description =~ "Linear"
+    assert graphql_description =~ "Linear"
+    assert attach_description =~ "Linear"
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -37,9 +51,30 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(text) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => ["linear_graphql", "linear_attach_issue_resource"]
              }
            }
+  end
+
+  test "linear_attach_issue_resource delegates stable attachment writes" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_attach_issue_resource",
+        %{
+          "issueId" => "issue-1",
+          "url" => "https://github.com/openai/symphony/pull/18",
+          "title" => "PR 18"
+        },
+        attach_resource: fn issue_id, url, title ->
+          send(test_pid, {:attach_resource_called, issue_id, url, title})
+          :ok
+        end
+      )
+
+    assert_received {:attach_resource_called, "issue-1", "https://github.com/openai/symphony/pull/18", "PR 18"}
+    assert response["success"] == true
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do
@@ -241,10 +276,45 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            ] = response["contentItems"]
 
     assert Jason.decode!(text) == %{
+      "error" => %{
+        "message" =>
+          "Tool arguments are invalid. `linear_graphql` expects a query payload; `linear_attach_issue_resource` expects `issueId`, `url`, and optional `title`."
+      }
+    }
+  end
+
+  test "linear_attach_issue_resource validates required arguments" do
+    response =
+      DynamicTool.execute(
+        "linear_attach_issue_resource",
+        %{"url" => "https://example.com"},
+        attach_resource: fn _, _, _ -> flunk("attach_resource should not be called") end
+      )
+
+    assert response["success"] == false
+
+    assert [
+             %{
+               "text" => text
+             }
+           ] = response["contentItems"]
+
+    assert Jason.decode!(text) == %{
              "error" => %{
-               "message" => "`linear_graphql` expects either a GraphQL query string or an object with `query` and optional `variables`."
+               "message" => "`linear_attach_issue_resource` requires a non-empty `issueId` string."
              }
            }
+  end
+
+  test "linear_attach_issue_resource surfaces attachment failures" do
+    response =
+      DynamicTool.execute(
+        "linear_attach_issue_resource",
+        %{"issueId" => "issue-1", "url" => "https://example.com"},
+        attach_resource: fn _, _, _ -> {:error, :attachment_link_failed} end
+      )
+
+    assert response["success"] == false
   end
 
   test "linear_graphql rejects invalid variables" do
