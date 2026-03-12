@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      suppressed_dispatch: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -60,6 +61,7 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      suppressed_dispatch: %{},
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
@@ -195,6 +197,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> maybe_suppress_spawned_child_dispatch(issue_id, update)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -223,6 +226,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
+    state = reconcile_suppressed_dispatch(state)
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -314,6 +318,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec reconcile_suppressed_dispatch_for_test(term()) :: term()
+  def reconcile_suppressed_dispatch_for_test(%State{} = state) do
+    reconcile_suppressed_dispatch(state)
+  end
+
+  def reconcile_suppressed_dispatch_for_test(state), do: state
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -331,6 +343,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec retry_candidate_issue_for_test(Issue.t(), term()) :: boolean()
+  def retry_candidate_issue_for_test(%Issue{} = issue, %State{} = state) do
+    retry_candidate_issue?(issue, state, terminal_state_set())
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -552,13 +570,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_created_at_sort_key(_issue), do: 9_223_372_036_854_775_807
 
   defp should_dispatch_issue?(
-         %Issue{} = issue,
-         %State{running: running, claimed: claimed} = state,
+         %Issue{id: issue_id} = issue,
+         %State{running: running, claimed: claimed, suppressed_dispatch: suppressed_dispatch} = state,
          active_states,
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !Map.has_key?(suppressed_dispatch, issue_id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -856,7 +875,7 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 
-      retry_candidate_issue?(issue, terminal_states) ->
+      retry_candidate_issue?(issue, state, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
 
       true ->
@@ -901,7 +920,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
+    if retry_candidate_issue?(issue, state, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
       {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
@@ -1293,6 +1312,42 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp record_session_completion_totals(state, _running_entry), do: state
 
+  defp reconcile_suppressed_dispatch(%State{suppressed_dispatch: suppressed_dispatch} = state)
+       when map_size(suppressed_dispatch) == 0,
+       do: state
+
+  defp reconcile_suppressed_dispatch(%State{suppressed_dispatch: suppressed_dispatch} = state) do
+    suppressed_ids = Map.keys(suppressed_dispatch)
+
+    case Tracker.fetch_issue_states_by_ids(suppressed_ids) do
+      {:ok, issues} ->
+        states_by_id =
+          Enum.reduce(issues, %{}, fn
+            %Issue{id: issue_id, state: issue_state}, acc when is_binary(issue_id) ->
+              Map.put(acc, issue_id, normalize_issue_state(issue_state))
+
+            _issue, acc ->
+              acc
+          end)
+
+        retained =
+          suppressed_dispatch
+          |> Enum.filter(fn {issue_id, _metadata} ->
+            case Map.get(states_by_id, issue_id) do
+              nil -> true
+              "todo" -> true
+              _ -> false
+            end
+          end)
+          |> Map.new()
+
+        %{state | suppressed_dispatch: retained}
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
 
@@ -1306,6 +1361,147 @@ defmodule SymphonyElixir.Orchestrator do
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+  end
+
+  defp retry_candidate_issue?(%Issue{id: issue_id} = issue, %State{} = state, terminal_states) do
+    !Map.has_key?(state.suppressed_dispatch, issue_id) and
+      retry_candidate_issue?(issue, terminal_states)
+  end
+
+  defp retry_candidate_issue?(_issue, _state, _terminal_states), do: false
+
+  defp extract_linear_tool_call(payload) when is_map(payload) do
+    params = map_lookup_any(payload, [["params"], [:params]])
+
+    tool_name =
+      first_present([
+        map_lookup_any(params || %{}, [["tool"], [:tool], ["name"], [:name]]),
+        map_lookup_any(payload, [["tool"], [:tool], ["name"], [:name]])
+      ])
+
+    arguments =
+      first_present([
+        map_lookup_any(params || %{}, [["arguments"], [:arguments]]),
+        map_lookup_any(payload, [["arguments"], [:arguments]])
+      ])
+
+    with tool_name when is_binary(tool_name) <- normalize_string(tool_name),
+         %{} = normalized_args <- normalize_linear_tool_arguments(arguments) do
+      {:ok, tool_name, normalized_args}
+    else
+      _ -> :error
+    end
+  end
+
+  defp extract_linear_tool_call(_payload), do: :error
+
+  defp normalize_linear_tool_arguments(arguments) when is_map(arguments), do: arguments
+
+  defp normalize_linear_tool_arguments(arguments) when is_binary(arguments) do
+    case Jason.decode(arguments) do
+      {:ok, %{} = decoded} -> decoded
+      _ -> %{}
+    end
+  end
+
+  defp normalize_linear_tool_arguments(_arguments), do: %{}
+
+  defp linear_operation_from_query(query) when is_binary(query) do
+    cond do
+      Regex.match?(~r/\bissueCreate\b/, query) -> :issue_create
+      Regex.match?(~r/\bcommentCreate\b/, query) -> :comment_create
+      Regex.match?(~r/\bissueUpdate\b/, query) -> :issue_update
+      true -> :unknown
+    end
+  end
+
+  defp linear_operation_from_query(_query), do: :unknown
+
+  defp maybe_suppress_spawned_child_dispatch(%State{} = state, parent_issue_id, update)
+       when is_binary(parent_issue_id) and is_map(update) do
+    payload = Map.get(update, :payload) || Map.get(update, "payload")
+    result = Map.get(update, :result) || Map.get(update, "result")
+
+    with :tool_call_completed <- Map.get(update, :event),
+         {:ok, "linear_graphql", normalized_args} <- extract_linear_tool_call(payload),
+         query when is_binary(query) <- map_lookup_any(normalized_args, [["query"], [:query]]),
+         :issue_create <- linear_operation_from_query(query),
+         child_issue_id when is_binary(child_issue_id) <- extract_created_issue_id(result) do
+      put_in(state.suppressed_dispatch[child_issue_id], %{parent_issue_id: parent_issue_id})
+    else
+      _ -> state
+    end
+  end
+
+  defp maybe_suppress_spawned_child_dispatch(state, _parent_issue_id, _update), do: state
+
+  defp extract_created_issue_id(%{} = result) do
+    result
+    |> extract_graphql_result_payload()
+    |> case do
+      %{} = payload ->
+        first_present([
+          map_lookup_any(payload, [["data", "issueCreate", "issue", "id"], [:data, :issueCreate, :issue, :id]]),
+          map_lookup_any(payload, [["issueCreate", "issue", "id"], [:issueCreate, :issue, :id]])
+        ])
+
+      _ ->
+        nil
+    end
+  end
+
+  defp extract_created_issue_id(_result), do: nil
+
+  defp extract_graphql_result_payload(%{"output" => text}) when is_binary(text) do
+    decode_graphql_result_text(text)
+  end
+
+  defp extract_graphql_result_payload(%{output: text}) when is_binary(text) do
+    decode_graphql_result_text(text)
+  end
+
+  defp extract_graphql_result_payload(%{"contentItems" => items}) when is_list(items) do
+    decode_graphql_result_items(items)
+  end
+
+  defp extract_graphql_result_payload(%{contentItems: items}) when is_list(items) do
+    decode_graphql_result_items(items)
+  end
+
+  defp extract_graphql_result_payload(%{"output" => items}) when is_list(items) do
+    decode_graphql_result_items(items)
+  end
+
+  defp extract_graphql_result_payload(%{output: items}) when is_list(items) do
+    decode_graphql_result_items(items)
+  end
+
+  defp extract_graphql_result_payload(items) when is_list(items) do
+    decode_graphql_result_items(items)
+  end
+
+  defp extract_graphql_result_payload(_result), do: %{}
+
+  defp decode_graphql_result_items(items) when is_list(items) do
+    Enum.find_value(items, %{}, fn
+      %{"type" => type, "text" => text} when type in ["inputText", "input_text"] and is_binary(text) ->
+        decode_graphql_result_text(text)
+
+      %{type: type, text: text} when type in ["inputText", "input_text"] and is_binary(text) ->
+        decode_graphql_result_text(text)
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp decode_graphql_result_items(_items), do: %{}
+
+  defp decode_graphql_result_text(text) when is_binary(text) do
+    case Jason.decode(text) do
+      {:ok, %{} = payload} -> payload
+      _ -> nil
+    end
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
@@ -1550,6 +1746,39 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp map_at_path(_payload, _path), do: nil
 
+  defp map_lookup(map, path) when is_map(map) and is_list(path) do
+    Enum.reduce_while(path, map, fn segment, acc ->
+      case acc do
+        current when is_map(current) ->
+          case Map.fetch(current, segment) do
+            {:ok, next} -> {:cont, next}
+            :error -> {:halt, nil}
+          end
+
+        _ ->
+          {:halt, nil}
+      end
+    end)
+  end
+
+  defp map_lookup(_map, _path), do: nil
+
+  defp map_lookup_any(map, paths) when is_map(map) and is_list(paths) do
+    Enum.find_value(paths, fn path -> map_lookup(map, path) end)
+  end
+
+  defp map_lookup_any(_map, _paths), do: nil
+
+  defp first_present(values) when is_list(values) do
+    Enum.find(values, fn value ->
+      case value do
+        nil -> false
+        "" -> false
+        _ -> true
+      end
+    end)
+  end
+
   defp integer_token_map?(payload) do
     token_fields = [
       :input_tokens,
@@ -1652,4 +1881,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integer_like(_value), do: nil
+
+  defp normalize_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_string(_value), do: nil
 end

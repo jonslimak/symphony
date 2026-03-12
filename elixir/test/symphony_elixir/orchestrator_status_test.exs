@@ -1552,6 +1552,115 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute rendered =~ "Timestamp:"
   end
 
+  test "orchestrator records suppression for successful linear issueCreate tool completions" do
+    issue_id = "issue-parent"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-301",
+      title: "Parent issue",
+      description: "Spawn child",
+      state: "Agent Review",
+      url: "https://example.org/issues/MT-301"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :SuppressionOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:codex_worker_update, issue_id, issue_create_update("child-name", :name)})
+    send(pid, {:codex_worker_update, issue_id, issue_create_update("child-tool", :tool)})
+
+    state = :sys.get_state(pid)
+
+    assert state.suppressed_dispatch == %{
+             "child-name" => %{parent_issue_id: issue_id},
+             "child-tool" => %{parent_issue_id: issue_id}
+           }
+  end
+
+  test "suppressed child is not dispatch-eligible" do
+    issue = %Issue{
+      id: "child-1",
+      identifier: "MT-302",
+      title: "Child issue",
+      description: "Run later",
+      state: "Todo",
+      url: "https://example.org/issues/MT-302"
+    }
+
+    state =
+      %Orchestrator.State{}
+      |> Map.put(:max_concurrent_agents, 1)
+      |> Map.put(:suppressed_dispatch, %{"child-1" => %{parent_issue_id: "parent-1"}})
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "suppressed child is not retry-eligible" do
+    issue = %Issue{
+      id: "child-2",
+      identifier: "MT-303",
+      title: "Child retry",
+      description: "Stay parked",
+      state: "Todo",
+      url: "https://example.org/issues/MT-303"
+    }
+
+    state = %Orchestrator.State{suppressed_dispatch: %{"child-2" => %{parent_issue_id: "parent-2"}}}
+
+    refute Orchestrator.retry_candidate_issue_for_test(issue, state)
+  end
+
+  test "suppression clears when child leaves Todo" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    child_issue = %Issue{
+      id: "child-3",
+      identifier: "MT-304",
+      title: "Child complete",
+      description: "No longer parked",
+      state: "Human Review",
+      url: "https://example.org/issues/MT-304"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [child_issue])
+
+    state =
+      %Orchestrator.State{
+        suppressed_dispatch: %{"child-3" => %{parent_issue_id: "parent-3"}}
+      }
+
+    reconciled = Orchestrator.reconcile_suppressed_dispatch_for_test(state)
+    assert reconciled.suppressed_dispatch == %{}
+  end
+
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
@@ -1600,5 +1709,43 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  defp issue_create_update(child_id, variant) do
+    graphql_payload = Jason.encode!(%{"data" => %{"issueCreate" => %{"issue" => %{"id" => child_id}}}})
+
+    {params, result} =
+      case variant do
+        :tool ->
+          {
+            %{
+              "tool" => "linear_graphql",
+              "arguments" => %{"query" => "mutation { issueCreate(input: {}) { issue { id } } }"}
+            },
+            %{
+              "success" => true,
+              "contentItems" => [%{"type" => "inputText", "text" => graphql_payload}]
+            }
+          }
+
+        :name ->
+          {
+            %{
+              "name" => "linear_graphql",
+              "arguments" => Jason.encode!(%{"query" => "mutation { issueCreate(input: {}) { issue { id } } }"})
+            },
+            %{
+              "success" => true,
+              "output" => graphql_payload
+            }
+          }
+      end
+
+    %{
+      event: :tool_call_completed,
+      payload: %{"params" => params},
+      result: result,
+      timestamp: DateTime.utc_now()
+    }
   end
 end
