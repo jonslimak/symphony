@@ -19,7 +19,7 @@ defmodule SymphonyElixir.RunRecordStore do
       {:error, reason} -> {:error, reason}
     end
   rescue
-    error in [Jason.EncodeError] ->
+    error in [Jason.EncodeError, Protocol.UndefinedError] ->
       {:error, {:encode_failed, error}}
   end
 

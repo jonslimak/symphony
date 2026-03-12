@@ -1024,6 +1024,28 @@ defmodule SymphonyElixir.Orchestrator do
     session_events(__MODULE__, event_stream_id, limit, 15_000)
   end
 
+  @spec debug_running_issue(String.t()) ::
+          {:ok, map()} | {:error, :not_running} | :timeout | :unavailable
+  def debug_running_issue(issue_identifier) when is_binary(issue_identifier) do
+    debug_running_issue(__MODULE__, issue_identifier, 15_000)
+  end
+
+  @spec debug_running_issue(GenServer.server(), String.t(), timeout()) ::
+          {:ok, map()} | {:error, :not_running} | :timeout | :unavailable
+  def debug_running_issue(server, issue_identifier, timeout)
+      when is_binary(issue_identifier) do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:debug_running_issue, issue_identifier}, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @spec session_events(GenServer.server(), String.t(), pos_integer(), timeout()) ::
           {:ok, [map()]} | {:error, :session_not_found} | :timeout | :unavailable
   def session_events(server, event_stream_id, limit, timeout)
@@ -1117,6 +1139,13 @@ defmodule SymphonyElixir.Orchestrator do
     case session_events_from_state(state, event_stream_id, limit) do
       {:ok, events} -> {:reply, {:ok, events}, state}
       {:error, :session_not_found} -> {:reply, {:error, :session_not_found}, state}
+    end
+  end
+
+  def handle_call({:debug_running_issue, issue_identifier}, _from, state) do
+    case debug_running_issue_from_state(state, issue_identifier) do
+      {:ok, payload} -> {:reply, {:ok, payload}, state}
+      {:error, :not_running} -> {:reply, {:error, :not_running}, state}
     end
   end
 
@@ -1830,6 +1859,31 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp session_events_from_state(_state, _event_stream_id, _limit), do: {:error, :session_not_found}
 
+  defp debug_running_issue_from_state(%State{} = state, issue_identifier)
+       when is_binary(issue_identifier) do
+    case Enum.find(state.running, fn {_issue_id, entry} ->
+           Map.get(entry, :identifier) == issue_identifier
+         end) do
+      {_issue_id, running_entry} ->
+        event_stream_id = Map.get(running_entry, :event_stream_id)
+        timeline_events = Map.get(state.timeline_events, event_stream_id, [])
+
+        {:ok,
+         %{
+           issue_identifier: issue_identifier,
+           event_stream_id: event_stream_id,
+           running_entry: normalize_debug_term(running_entry),
+           timeline_event_count: length(timeline_events),
+           timeline_event_sample: sample_timeline_events(timeline_events)
+         }}
+
+      nil ->
+        {:error, :not_running}
+    end
+  end
+
+  defp debug_running_issue_from_state(_state, _issue_identifier), do: {:error, :not_running}
+
   defp read_session_events_from_store(event_stream_id, limit) do
     case SessionTimelineStore.read(event_stream_id, limit) do
       {:ok, events} when is_list(events) -> events
@@ -1885,6 +1939,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp known_event_stream_id?(_state, _event_stream_id), do: false
+
+  defp sample_timeline_events(events) when is_list(events) do
+    count = length(events)
+
+    cond do
+      count <= 4 ->
+        Enum.map(events, &normalize_debug_term/1)
+
+      true ->
+        Enum.take(events, 2)
+        |> Kernel.++(Enum.take(events, -2))
+        |> Enum.map(&normalize_debug_term/1)
+    end
+  end
+
+  defp sample_timeline_events(_events), do: []
 
   defp prune_timeline_events(%State{} = state) do
     keep_ids =
@@ -2019,7 +2089,9 @@ defmodule SymphonyElixir.Orchestrator do
 
           {:error, reason} ->
             Logger.warning(
-              "Failed to persist run record issue_identifier=#{Map.get(running_entry, :identifier)} event_stream_id=#{event_stream_id}: #{inspect(reason)}"
+              "Failed to persist run record issue_identifier=#{Map.get(running_entry, :identifier)} " <>
+                "event_stream_id=#{event_stream_id} path=#{RunRecordStore.path(event_stream_id)} " <>
+                "keys=#{inspect(Map.keys(record))}: #{inspect(reason)}"
             )
 
             state
@@ -2060,6 +2132,7 @@ defmodule SymphonyElixir.Orchestrator do
       failure_class: derive_failure_class(stop_reason, failure_summary, timeline_events, final_status),
       failure_summary: derive_failure_summary(stop_reason, failure_summary)
     }
+    |> normalize_run_record()
   end
 
   defp timeline_events_for_run_record(%State{} = state, event_stream_id) when is_binary(event_stream_id) do
@@ -2138,6 +2211,46 @@ defmodule SymphonyElixir.Orchestrator do
   defp derive_failure_summary(stop_reason, _failure_summary) when is_binary(stop_reason), do: stop_reason
   defp derive_failure_summary(_stop_reason, _failure_summary), do: nil
 
+  defp normalize_run_record(%{} = record) do
+    %{
+      issue_identifier: normalize_optional_string(Map.get(record, :issue_identifier)),
+      issue_id: normalize_optional_string(Map.get(record, :issue_id)),
+      session_id: normalize_optional_string(Map.get(record, :session_id)),
+      event_stream_id: normalize_optional_string(Map.get(record, :event_stream_id)),
+      workflow_path: normalize_optional_string(Map.get(record, :workflow_path)),
+      started_at: normalize_optional_string(Map.get(record, :started_at)),
+      ended_at: normalize_optional_string(Map.get(record, :ended_at)),
+      final_status: normalize_optional_string(Map.get(record, :final_status)),
+      next_action: normalize_optional_string(Map.get(record, :next_action)),
+      final_tracker_state: normalize_optional_string(Map.get(record, :final_tracker_state)),
+      run_kind: normalize_optional_string(Map.get(record, :run_kind)),
+      path_summary: normalize_string_list(Map.get(record, :path_summary)),
+      key_evidence: normalize_string_list(Map.get(record, :key_evidence)),
+      failure_class: normalize_optional_string(Map.get(record, :failure_class)),
+      failure_summary: normalize_optional_string(Map.get(record, :failure_summary))
+    }
+  end
+
+  defp normalize_string_list(values) when is_list(values) do
+    values
+    |> Enum.map(&normalize_optional_string/1)
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+  end
+
+  defp normalize_string_list(_values), do: []
+
+  defp normalize_optional_string(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_optional_string(value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_optional_string(value) when is_integer(value), do: Integer.to_string(value)
+  defp normalize_optional_string(value) when is_float(value), do: :erlang.float_to_binary(value, [:compact])
+  defp normalize_optional_string(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp normalize_optional_string(nil), do: nil
+  defp normalize_optional_string(value), do: inspect(value)
+
   defp timeline_event_action?(event, action) when is_map(event) and is_binary(action) do
     map_value(event, :action) == action
   end
@@ -2160,6 +2273,25 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp map_value(map, key) when is_map(map), do: Map.get(map, key)
   defp map_value(_map, _key), do: nil
+
+  defp normalize_debug_term(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp normalize_debug_term(%_{} = struct), do: struct |> Map.from_struct() |> normalize_debug_term()
+
+  defp normalize_debug_term(map) when is_map(map) do
+    map
+    |> Enum.map(fn {key, value} -> {normalize_debug_key(key), normalize_debug_term(value)} end)
+    |> Enum.into(%{})
+  end
+
+  defp normalize_debug_term(list) when is_list(list), do: Enum.map(list, &normalize_debug_term/1)
+  defp normalize_debug_term(value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_debug_term(value) when is_pid(value), do: inspect(value)
+  defp normalize_debug_term(value) when is_reference(value), do: inspect(value)
+  defp normalize_debug_term(value) when is_tuple(value), do: value |> Tuple.to_list() |> Enum.map(&normalize_debug_term/1)
+  defp normalize_debug_term(value), do: value
+
+  defp normalize_debug_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp normalize_debug_key(key), do: key
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())

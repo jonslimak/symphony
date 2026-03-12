@@ -42,6 +42,17 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec debug_running_issue(Conn.t(), map()) :: Conn.t()
+  def debug_running_issue(conn, %{"issue_identifier" => issue_identifier}) do
+    case Presenter.debug_running_issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
+      {:ok, payload} ->
+        json(conn, payload)
+
+      {:error, :not_running} ->
+        error_response(conn, 404, "not_running", "Issue is not currently running")
+    end
+  end
+
   @spec refresh(Conn.t(), map()) :: Conn.t()
   def refresh(conn, _params) do
     case Presenter.refresh_payload(orchestrator()) do

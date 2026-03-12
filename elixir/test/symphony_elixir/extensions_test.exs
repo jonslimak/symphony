@@ -93,6 +93,18 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       {:reply, reply, state}
     end
+
+    def handle_call({:debug_running_issue, issue_identifier}, _from, state) do
+      debug_running = Keyword.get(state, :debug_running, %{})
+
+      reply =
+        case Map.get(debug_running, issue_identifier) do
+          %{} = payload -> {:ok, payload}
+          _ -> {:error, :not_running}
+        end
+
+      {:reply, reply, state}
+    end
   end
 
   setup do
@@ -401,6 +413,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         name: orchestrator_name,
         snapshot: snapshot,
         session_events: static_session_events(),
+        debug_running: static_debug_running(),
         refresh: %{
           queued: true,
           coalesced: false,
@@ -534,8 +547,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(conn, 404) == %{
              "error" => %{
                "code" => "session_not_found",
-               "message" => "Session timeline not found"
+             "message" => "Session timeline not found"
              }
+           }
+
+    conn = get(build_conn(), "/api/v1/debug/running/MT-HTTP")
+
+    assert json_response(conn, 200) == %{
+             "issue_identifier" => "MT-HTTP",
+             "event_stream_id" => "mt-http-session",
+             "running_entry" => %{
+               "identifier" => "MT-HTTP",
+               "event_stream_id" => "mt-http-session",
+               "turn_count" => 7
+             },
+             "timeline_event_count" => 3,
+             "timeline_event_sample" => [
+               %{"event" => "session_started", "message" => "session started"}
+             ]
+           }
+
+    conn = get(build_conn(), "/api/v1/debug/running/MT-MISSING")
+
+    assert json_response(conn, 404) == %{
+             "error" => %{"code" => "not_running", "message" => "Issue is not currently running"}
            }
 
     conn = post(build_conn(), "/api/v1/refresh", %{})
@@ -1220,6 +1255,27 @@ defmodule SymphonyElixir.ExtensionsTest do
           message: "done"
         }
       ]
+    }
+  end
+
+  defp static_debug_running do
+    %{
+      "MT-HTTP" => %{
+        issue_identifier: "MT-HTTP",
+        event_stream_id: "mt-http-session",
+        running_entry: %{
+          identifier: "MT-HTTP",
+          event_stream_id: "mt-http-session",
+          turn_count: 7
+        },
+        timeline_event_count: 3,
+        timeline_event_sample: [
+          %{
+            event: "session_started",
+            message: "session started"
+          }
+        ]
+      }
     }
   end
 

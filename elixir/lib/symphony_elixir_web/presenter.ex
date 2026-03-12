@@ -85,6 +85,22 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec debug_running_issue_payload(String.t(), GenServer.name(), timeout()) ::
+          {:ok, map()} | {:error, :not_running}
+  def debug_running_issue_payload(issue_identifier, orchestrator, timeout)
+      when is_binary(issue_identifier) do
+    case Orchestrator.debug_running_issue(orchestrator, issue_identifier, timeout) do
+      {:ok, %{} = payload} ->
+        {:ok, payload}
+
+      {:error, :not_running} ->
+        {:error, :not_running}
+
+      _ ->
+        {:error, :not_running}
+    end
+  end
+
   defp issue_payload_body(issue_identifier, running, retry) do
     %{
       issue_identifier: issue_identifier,

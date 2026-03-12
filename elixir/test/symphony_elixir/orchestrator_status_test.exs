@@ -302,6 +302,79 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator debug running issue returns raw entry and timeline summary for a running issue" do
+    issue_id = "issue-debug-running"
+    stream_id = "mt-304-session-#{System.unique_integer([:positive])}"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-304",
+      title: "Debug running issue test",
+      description: "Expose running entry for debug",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-304"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :DebugRunningIssueOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      initial_tracker_state: "Todo",
+      workflow_path: Workflow.workflow_file_path(),
+      event_stream_id: stream_id,
+      session_id: "thread-debug-running",
+      turn_count: 1,
+      retry_attempt: 1,
+      started_at: DateTime.utc_now(),
+      last_codex_timestamp: DateTime.utc_now(),
+      last_codex_message: %{event: :notification, payload: %{method: "turn/diff/updated"}},
+      last_codex_event: :notification,
+      codex_input_tokens: 10,
+      codex_output_tokens: 2,
+      codex_total_tokens: 12
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:timeline_events, %{
+        stream_id => [
+          %{event: "session_started", message: "session started"},
+          %{event: "notification", message: "debug event 1"},
+          %{event: "notification", message: "debug event 2"},
+          %{event: "notification", message: "debug event 3"},
+          %{event: "turn_completed", message: "done"}
+        ]
+      })
+    end)
+
+    assert {:ok, payload} = Orchestrator.debug_running_issue(orchestrator_name, "MT-304", 1_000)
+    assert payload.issue_identifier == "MT-304"
+    assert payload.event_stream_id == stream_id
+    assert payload.timeline_event_count == 5
+    assert length(payload.timeline_event_sample) == 4
+    assert payload.running_entry["identifier"] == "MT-304"
+    assert payload.running_entry["issue"]["state"] == "In Progress"
+    assert payload.running_entry["event_stream_id"] == stream_id
+    assert payload.running_entry["last_codex_event"] == "notification"
+
+    assert {:error, :not_running} =
+             Orchestrator.debug_running_issue(orchestrator_name, "MT-MISSING", 1_000)
+  end
+
   test "session events reads persisted history for active sessions beyond in-memory window" do
     issue_id = "issue-persisted-session-events"
     stream_id = "mt-persisted-session"
@@ -645,6 +718,104 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert record["next_action"] == "retry"
     assert record["failure_class"] == "tool_failure"
     assert record["failure_summary"] == "agent exited: :boom"
+  end
+
+  test "normal session completion persists a presenter-visible run record with live-like fields" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-run-record-live-like-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace_root)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    issue_id = "issue-run-record-live-like"
+    running_ref = make_ref()
+    stream_id = "mt-355-stream"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-355",
+      title: "Run record live-like completion",
+      description: "Persist run record on realistic completion path",
+      state: "Human Review",
+      url: "https://example.org/issues/MT-355"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RunRecordLiveLikeOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm_rf(workspace_root)
+    end)
+
+    running_entry = %{
+      pid: self(),
+      ref: running_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      initial_tracker_state: "In Progress",
+      workflow_path: Workflow.workflow_file_path(),
+      event_stream_id: stream_id,
+      session_id: "thread-run-record-live-like",
+      turn_count: 1,
+      retry_attempt: 1,
+      started_at: DateTime.add(now, -30, :second),
+      last_codex_timestamp: now,
+      last_codex_message: %{
+        event: "turn_completed",
+        message: %{method: "turn/completed"},
+        timestamp: now
+      },
+      last_codex_event: :turn_completed,
+      codex_input_tokens: 20,
+      codex_output_tokens: 10,
+      codex_total_tokens: 30
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.put(state.running, issue_id, running_entry),
+          claimed: MapSet.put(state.claimed, issue_id),
+          timeline_events: %{
+            stream_id => [
+              %{event: "notification", action: "thread_status_changed", message: "thread/status/changed"},
+              %{event: "malformed", action: "malformed_event", message: "malformed JSON event from codex"},
+              %{event: "notification", action: "git_commit", message: "git commit"},
+              %{event: "notification", action: "github_pr_create", message: "gh pr create"},
+              %{event: "turn_completed", message: "turn completed"}
+            ]
+          }
+      }
+    end)
+
+    send(pid, {:DOWN, running_ref, :process, self(), :normal})
+
+    assert {:ok, record} = wait_for_run_record(stream_id, 1_000)
+    assert record["issue_identifier"] == "MT-355"
+    assert record["final_status"] == "completed"
+    assert record["next_action"] == "continuation"
+    assert record["final_tracker_state"] == "Human Review"
+    assert record["run_kind"] == "normal"
+    assert record["path_summary"] == ["In Progress", "Human Review"]
+    assert record["key_evidence"] == ["malformed_event_seen", "git_commit", "github_pr_create"]
+    assert is_binary(record["workflow_path"])
+
+    assert {:ok, payload} =
+             SymphonyElixirWeb.Presenter.session_events_payload(
+               stream_id,
+               100,
+               orchestrator_name,
+               50
+             )
+
+    assert payload.run_record["issue_identifier"] == "MT-355"
+    assert payload.run_record["final_status"] == "completed"
+    assert length(payload.events) == 5
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

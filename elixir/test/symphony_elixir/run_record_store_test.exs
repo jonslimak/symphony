@@ -43,4 +43,13 @@ defmodule SymphonyElixir.RunRecordStoreTest do
   test "read returns not_found when record file is missing" do
     assert {:error, :not_found} = RunRecordStore.read("missing-stream")
   end
+
+  test "write returns an encode error for non-json-safe payload values" do
+    assert {:error, {:encode_failed, _error}} =
+             RunRecordStore.write("bad-stream", %{
+               issue_identifier: "MT-502",
+               event_stream_id: "bad-stream",
+               bad_value: self()
+             })
+  end
 end
