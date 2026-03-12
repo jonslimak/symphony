@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, InactiveSessionStore, SessionTimelineStore, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, InactiveSessionStore, RunRecordStore, SessionTimelineStore, StatusDashboard, Tracker, Workflow, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -125,6 +125,11 @@ defmodule SymphonyElixir.Orchestrator do
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
+              |> persist_run_record(running_entry, %{
+                final_status: "completed",
+                next_action: "continuation",
+                stop_reason: down_stop_reason(reason)
+              })
               |> complete_issue(issue_id)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
@@ -136,7 +141,14 @@ defmodule SymphonyElixir.Orchestrator do
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              state
+              |> persist_run_record(running_entry, %{
+                final_status: "failed",
+                next_action: "retry",
+                stop_reason: down_stop_reason(reason),
+                failure_summary: "agent exited: #{inspect(reason)}"
+              })
+              |> schedule_issue_retry(issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}"
               })
@@ -405,7 +417,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, stop_reason) do
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, stop_reason, opts \\ []) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
@@ -415,6 +427,12 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> record_session_completion_totals(running_entry)
           |> record_inactive_session(running_entry, stop_reason)
+          |> persist_run_record(running_entry, %{
+            final_status: Keyword.get(opts, :final_status, "stopped"),
+            next_action: Keyword.get(opts, :next_action, "none"),
+            stop_reason: stop_reason,
+            failure_summary: Keyword.get(opts, :failure_summary)
+          })
 
         if cleanup_workspace do
           cleanup_issue_workspace(identifier)
@@ -472,7 +490,11 @@ defmodule SymphonyElixir.Orchestrator do
       next_attempt = next_retry_attempt_from_running(running_entry)
 
       state
-      |> terminate_running_issue(issue_id, false, "stalled_restart")
+      |> terminate_running_issue(issue_id, false, "stalled_restart",
+        final_status: "failed",
+        next_action: "retry",
+        failure_summary: "stalled for #{elapsed_ms}ms without codex activity"
+      )
       |> schedule_issue_retry(issue_id, next_attempt, %{
         identifier: identifier,
         error: "stalled for #{elapsed_ms}ms without codex activity"
@@ -691,6 +713,8 @@ defmodule SymphonyElixir.Orchestrator do
             ref: ref,
             identifier: issue.identifier,
             issue: issue,
+            initial_tracker_state: issue.state,
+            workflow_path: Workflow.workflow_file_path(),
             event_stream_id: event_stream_id,
             session_id: nil,
             last_codex_message: nil,
@@ -1984,6 +2008,144 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_inactive_session(state, _running_entry, _stop_reason), do: state
+
+  defp persist_run_record(%State{} = state, running_entry, attrs)
+       when is_map(running_entry) and is_map(attrs) do
+    case build_run_record(state, running_entry, attrs) do
+      %{event_stream_id: event_stream_id} = record when is_binary(event_stream_id) and event_stream_id != "" ->
+        case RunRecordStore.write(event_stream_id, record) do
+          :ok ->
+            state
+
+          {:error, reason} ->
+            Logger.warning(
+              "Failed to persist run record issue_identifier=#{Map.get(running_entry, :identifier)} event_stream_id=#{event_stream_id}: #{inspect(reason)}"
+            )
+
+            state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp persist_run_record(state, _running_entry, _attrs), do: state
+
+  defp build_run_record(%State{} = state, running_entry, attrs) when is_map(running_entry) and is_map(attrs) do
+    ended_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    issue = Map.get(running_entry, :issue, %{})
+    event_stream_id = Map.get(running_entry, :event_stream_id)
+    timeline_events = timeline_events_for_run_record(state, event_stream_id)
+    initial_tracker_state = Map.get(running_entry, :initial_tracker_state)
+    final_tracker_state = map_value(issue, :state)
+    failure_summary = Map.get(attrs, :failure_summary)
+    stop_reason = Map.get(attrs, :stop_reason)
+    final_status = Map.get(attrs, :final_status, "stopped")
+
+    %{
+      issue_identifier: Map.get(running_entry, :identifier),
+      issue_id: map_value(issue, :id),
+      session_id: Map.get(running_entry, :session_id),
+      event_stream_id: event_stream_id,
+      workflow_path: Map.get(running_entry, :workflow_path) || Workflow.workflow_file_path(),
+      started_at: datetime_to_iso8601(Map.get(running_entry, :started_at)),
+      ended_at: DateTime.to_iso8601(ended_at),
+      final_status: final_status,
+      next_action: Map.get(attrs, :next_action, "none"),
+      final_tracker_state: final_tracker_state,
+      run_kind: derive_run_kind(running_entry, timeline_events),
+      path_summary: derive_path_summary(initial_tracker_state, final_tracker_state),
+      key_evidence: derive_key_evidence(timeline_events),
+      failure_class: derive_failure_class(stop_reason, failure_summary, timeline_events, final_status),
+      failure_summary: derive_failure_summary(stop_reason, failure_summary)
+    }
+  end
+
+  defp timeline_events_for_run_record(%State{} = state, event_stream_id) when is_binary(event_stream_id) do
+    Map.get(state.timeline_events, event_stream_id, [])
+  end
+
+  defp timeline_events_for_run_record(_state, _event_stream_id), do: []
+
+  defp derive_run_kind(running_entry, timeline_events) when is_map(running_entry) and is_list(timeline_events) do
+    initial_tracker_state =
+      case Map.get(running_entry, :initial_tracker_state) do
+        value when is_binary(value) -> normalize_issue_state(value)
+        _ -> nil
+      end
+
+    cond do
+      initial_tracker_state == "rework" ->
+        "rework"
+
+      Map.get(running_entry, :retry_attempt, 1) > 1 ->
+        "retry"
+
+      Enum.any?(timeline_events, &timeline_event_action?(&1, "linear_issue_create")) ->
+        "child_spawn_parent"
+
+      true ->
+        "normal"
+    end
+  end
+
+  defp derive_path_summary(initial_tracker_state, final_tracker_state) do
+    [initial_tracker_state, final_tracker_state]
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.uniq()
+  end
+
+  defp derive_key_evidence(timeline_events) when is_list(timeline_events) do
+    timeline_events
+    |> Enum.reduce([], fn event, acc ->
+      evidence =
+        cond do
+          timeline_event_action?(event, "linear_issue_create") -> "linear_issue_create"
+          timeline_event_action?(event, "linear_status_change") -> "linear_status_change"
+          timeline_event_action?(event, "github_pr_create") -> "github_pr_create"
+          timeline_event_action?(event, "git_commit") -> "git_commit"
+          timeline_event_action?(event, "malformed_event") -> "malformed_event_seen"
+          true -> nil
+        end
+
+      if is_binary(evidence), do: [evidence | acc], else: acc
+    end)
+    |> Enum.uniq()
+    |> Enum.reverse()
+  end
+
+  defp derive_failure_class(stop_reason, failure_summary, timeline_events, final_status) do
+    cond do
+      final_status == "completed" or final_status == "stopped" ->
+        "none"
+
+      is_binary(stop_reason) and String.contains?(stop_reason, "stalled") ->
+        "runtime_stall"
+
+      is_binary(failure_summary) and String.contains?(failure_summary, "agent exited") ->
+        "tool_failure"
+
+      Enum.any?(timeline_events, &timeline_event_action?(&1, "malformed_event")) ->
+        "session_malformed"
+
+      true ->
+        "none"
+    end
+  end
+
+  defp derive_failure_summary(_stop_reason, failure_summary) when is_binary(failure_summary), do: failure_summary
+  defp derive_failure_summary(stop_reason, _failure_summary) when is_binary(stop_reason), do: stop_reason
+  defp derive_failure_summary(_stop_reason, _failure_summary), do: nil
+
+  defp timeline_event_action?(event, action) when is_map(event) and is_binary(action) do
+    map_value(event, :action) == action
+  end
+
+  defp timeline_event_action?(_event, _action), do: false
+
+  defp datetime_to_iso8601(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp datetime_to_iso8601(_value), do: nil
 
   defp load_persisted_inactive_sessions(%State{} = state) do
     case InactiveSessionStore.read_recent(@inactive_sessions_limit) do

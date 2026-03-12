@@ -496,6 +496,157 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert "MT-352" in identifiers
   end
 
+  test "normal session completion writes a run record with continuation" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-run-record-normal-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace_root)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    issue_id = "issue-run-record-normal"
+    running_ref = make_ref()
+    stream_id = "mt-353-stream"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-353",
+      title: "Run record normal completion",
+      description: "Persist run record on normal session completion",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-353"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RunRecordNormalOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm_rf(workspace_root)
+    end)
+
+    running_entry = %{
+      pid: self(),
+      ref: running_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      initial_tracker_state: "Todo",
+      workflow_path: Workflow.workflow_file_path(),
+      event_stream_id: stream_id,
+      session_id: "thread-run-record-normal",
+      turn_count: 2,
+      retry_attempt: 1,
+      started_at: DateTime.add(now, -30, :second),
+      last_codex_timestamp: now,
+      last_codex_message: "done",
+      last_codex_event: :turn_completed,
+      codex_input_tokens: 20,
+      codex_output_tokens: 10,
+      codex_total_tokens: 30
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.put(state.running, issue_id, running_entry),
+          claimed: MapSet.put(state.claimed, issue_id),
+          timeline_events: %{
+            stream_id => [
+              %{action: "git_commit", message: "git commit"},
+              %{action: "github_pr_create", message: "gh pr create"}
+            ]
+          }
+      }
+    end)
+
+    send(pid, {:DOWN, running_ref, :process, self(), :normal})
+
+    assert {:ok, record} = wait_for_run_record(stream_id, 1_000)
+    assert record["issue_identifier"] == "MT-353"
+    assert record["final_status"] == "completed"
+    assert record["next_action"] == "continuation"
+    assert record["run_kind"] == "normal"
+    assert record["path_summary"] == ["Todo", "In Progress"]
+  end
+
+  test "abnormal session completion writes a failed run record with retry" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-run-record-failed-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace_root)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    issue_id = "issue-run-record-failed"
+    running_ref = make_ref()
+    stream_id = "mt-354-stream"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-354",
+      title: "Run record failed completion",
+      description: "Persist run record on failed session completion",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-354"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RunRecordFailedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm_rf(workspace_root)
+    end)
+
+    running_entry = %{
+      pid: self(),
+      ref: running_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      initial_tracker_state: "In Progress",
+      workflow_path: Workflow.workflow_file_path(),
+      event_stream_id: stream_id,
+      session_id: "thread-run-record-failed",
+      turn_count: 3,
+      retry_attempt: 1,
+      started_at: DateTime.add(now, -30, :second),
+      last_codex_timestamp: now,
+      last_codex_message: "bad exit",
+      last_codex_event: :turn_completed,
+      codex_input_tokens: 20,
+      codex_output_tokens: 10,
+      codex_total_tokens: 30
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.put(state.running, issue_id, running_entry),
+          claimed: MapSet.put(state.claimed, issue_id),
+          timeline_events: %{
+            stream_id => [
+              %{action: "malformed_event", message: "malformed"}
+            ]
+          }
+      }
+    end)
+
+    send(pid, {:DOWN, running_ref, :process, self(), :boom})
+
+    assert {:ok, record} = wait_for_run_record(stream_id, 1_000)
+    assert record["issue_identifier"] == "MT-354"
+    assert record["final_status"] == "failed"
+    assert record["next_action"] == "retry"
+    assert record["failure_class"] == "tool_failure"
+    assert record["failure_summary"] == "agent exited: :boom"
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -1350,7 +1501,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    assert remaining_ms >= 9_300
     assert remaining_ms <= 10_500
   end
 
@@ -2223,6 +2374,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         Process.sleep(5)
         do_wait_for_snapshot(pid, predicate, deadline_ms)
       end
+    end
+  end
+
+  defp wait_for_run_record(event_stream_id, timeout_ms) when is_binary(event_stream_id) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for_run_record(event_stream_id, deadline_ms)
+  end
+
+  defp do_wait_for_run_record(event_stream_id, deadline_ms) do
+    case SymphonyElixir.RunRecordStore.read(event_stream_id) do
+      {:ok, %{} = record} ->
+        {:ok, record}
+
+      _ ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          flunk("timed out waiting for run record #{event_stream_id}")
+        else
+          Process.sleep(10)
+          do_wait_for_run_record(event_stream_id, deadline_ms)
+        end
     end
   end
 

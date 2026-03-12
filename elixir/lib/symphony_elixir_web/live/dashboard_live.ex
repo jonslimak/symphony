@@ -24,6 +24,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:activity_mode, "human")
       |> assign(:activity_stream_id, nil)
       |> assign(:activity_issue_identifier, nil)
+      |> assign(:activity_run_record, nil)
       |> assign(:activity_events_raw, [])
       |> assign(:activity_events_readable, [])
       |> assign(:activity_events_human, [])
@@ -77,7 +78,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       end
 
     now = socket.assigns.now || DateTime.utc_now()
-    {raw_events, readable_events, human_events, error} = load_session_events(stream_id, now)
+    {run_record, raw_events, readable_events, human_events, error} = load_session_events(stream_id, now)
     {socket, merged_human_events} = update_human_ledger(socket, stream_id, human_events)
 
     {:noreply,
@@ -86,6 +87,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
      |> assign(:activity_mode, "human")
      |> assign(:activity_stream_id, stream_id)
      |> assign(:activity_issue_identifier, issue_identifier)
+     |> assign(:activity_run_record, run_record)
      |> assign(:activity_events_raw, raw_events)
      |> assign(:activity_events_readable, readable_events)
      |> assign(:activity_events_human, merged_human_events)
@@ -780,6 +782,49 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <%= if @activity_error do %>
               <p class="empty-state"><%= @activity_error %></p>
             <% else %>
+              <section :if={is_map(@activity_run_record)} class="activity-summary-panel">
+                <div class="activity-summary-head">
+                  <p class="eyebrow">Run Record</p>
+                </div>
+                <dl class="activity-summary-grid">
+                  <div>
+                    <dt class="muted mono">Final status</dt>
+                    <dd><%= @activity_run_record["final_status"] || @activity_run_record[:final_status] || "n/a" %></dd>
+                  </div>
+                  <div>
+                    <dt class="muted mono">Next action</dt>
+                    <dd><%= @activity_run_record["next_action"] || @activity_run_record[:next_action] || "n/a" %></dd>
+                  </div>
+                  <div>
+                    <dt class="muted mono">Tracker state</dt>
+                    <dd><%= @activity_run_record["final_tracker_state"] || @activity_run_record[:final_tracker_state] || "n/a" %></dd>
+                  </div>
+                  <div>
+                    <dt class="muted mono">Run kind</dt>
+                    <dd><%= @activity_run_record["run_kind"] || @activity_run_record[:run_kind] || "n/a" %></dd>
+                  </div>
+                  <div>
+                    <dt class="muted mono">Path</dt>
+                    <dd><%= format_run_record_path(@activity_run_record["path_summary"] || @activity_run_record[:path_summary]) %></dd>
+                  </div>
+                  <div>
+                    <dt class="muted mono">Failure class</dt>
+                    <dd><%= @activity_run_record["failure_class"] || @activity_run_record[:failure_class] || "none" %></dd>
+                  </div>
+                </dl>
+                <div :if={run_record_evidence_present?(@activity_run_record)} class="activity-summary-evidence">
+                  <p class="muted mono">Evidence</p>
+                  <p><%= format_run_record_evidence(@activity_run_record["key_evidence"] || @activity_run_record[:key_evidence]) %></p>
+                </div>
+                <div
+                  :if={is_binary(@activity_run_record["failure_summary"] || @activity_run_record[:failure_summary]) and String.trim(@activity_run_record["failure_summary"] || @activity_run_record[:failure_summary]) != ""}
+                  class="activity-summary-evidence"
+                >
+                  <p class="muted mono">Failure summary</p>
+                  <p><%= @activity_run_record["failure_summary"] || @activity_run_record[:failure_summary] %></p>
+                </div>
+              </section>
+
               <%= if visible_activity_events(@activity_mode, @activity_events_human, @activity_events_readable, @activity_events_raw) == [] do %>
                 <%= if @activity_mode == "human" do %>
                   <p class="empty-state">No human actions yet. Switch to Readable or Raw to inspect all session events.</p>
@@ -1226,13 +1271,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
     if socket.assigns.activity_drawer_open and is_binary(socket.assigns.activity_stream_id) do
       now = socket.assigns.now || DateTime.utc_now()
 
-      {raw_events, readable_events, human_events, error} =
+      {run_record, raw_events, readable_events, human_events, error} =
         load_session_events(socket.assigns.activity_stream_id, now)
 
       {socket, merged_human_events} =
         update_human_ledger(socket, socket.assigns.activity_stream_id, human_events)
 
       socket
+      |> assign(:activity_run_record, run_record)
       |> assign(:activity_events_raw, raw_events)
       |> assign(:activity_events_readable, readable_events)
       |> assign(:activity_events_human, merged_human_events)
@@ -1250,8 +1296,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
            orchestrator(),
            snapshot_timeout_ms()
          ) do
-      {:ok, %{events: events}} when is_list(events) ->
+      {:ok, %{events: events} = payload} when is_list(events) ->
         {
+          Map.get(payload, :run_record) || Map.get(payload, "run_record"),
           SessionActivityFormatter.raw_events(events, now),
           SessionActivityFormatter.readable_events(events, now),
           SessionActivityFormatter.human_action_events(events, now),
@@ -1259,14 +1306,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
         }
 
       {:error, :session_not_found} ->
-        {[], [], [], "Session timeline not found."}
+        {nil, [], [], [], "Session timeline not found."}
 
       _ ->
-        {[], [], [], "Session timeline unavailable."}
+        {nil, [], [], [], "Session timeline unavailable."}
     end
   end
 
-  defp load_session_events(_stream_id, _now), do: {[], [], [], "Session timeline unavailable."}
+  defp load_session_events(_stream_id, _now), do: {nil, [], [], [], "Session timeline unavailable."}
 
   defp update_human_ledger(socket, stream_id, new_events)
        when is_binary(stream_id) and is_list(new_events) do
@@ -1320,12 +1367,36 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp activity_mode_button_class(true), do: "activity-mode-button activity-mode-button-active"
   defp activity_mode_button_class(false), do: "activity-mode-button"
 
+  defp format_run_record_path(path_summary) when is_list(path_summary) do
+    path_summary
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> case do
+      [] -> "n/a"
+      values -> Enum.join(values, " -> ")
+    end
+  end
+
+  defp format_run_record_path(_path_summary), do: "n/a"
+
+  defp run_record_evidence_present?(%{} = run_record) do
+    case run_record["key_evidence"] || run_record[:key_evidence] do
+      values when is_list(values) -> values != []
+      _ -> false
+    end
+  end
+
+  defp run_record_evidence_present?(_run_record), do: false
+
+  defp format_run_record_evidence(values) when is_list(values), do: Enum.join(values, ", ")
+  defp format_run_record_evidence(_values), do: "n/a"
+
   defp close_activity_drawer(socket) do
     socket
     |> assign(:activity_drawer_open, false)
     |> assign(:activity_mode, "human")
     |> assign(:activity_stream_id, nil)
     |> assign(:activity_issue_identifier, nil)
+    |> assign(:activity_run_record, nil)
     |> assign(:activity_events_raw, [])
     |> assign(:activity_events_readable, [])
     |> assign(:activity_events_human, [])

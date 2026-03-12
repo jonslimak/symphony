@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.RunRecordStore
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -393,6 +394,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
 
+    File.rm_rf(RunRecordStore.path("mt-http-session"))
+
     {:ok, _pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
@@ -508,6 +511,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert session_events_payload == %{
              "event_stream_id" => "mt-http-session",
+             "run_record" => nil,
              "events" => [
                %{
                  "at" => "2026-01-01T10:00:05Z",
@@ -646,6 +650,20 @@ defmodule SymphonyElixir.ExtensionsTest do
     orchestrator_name = Module.concat(__MODULE__, :DashboardOrchestrator)
     snapshot = static_snapshot()
 
+    assert :ok =
+             RunRecordStore.write("mt-http-session", %{
+               issue_identifier: "MT-HTTP",
+               event_stream_id: "mt-http-session",
+               final_status: "completed",
+               next_action: "continuation",
+               final_tracker_state: "In Progress",
+               run_kind: "normal",
+               path_summary: ["Todo", "In Progress"],
+               key_evidence: ["git_commit", "github_pr_create"],
+               failure_class: "none",
+               failure_summary: nil
+             })
+
     {:ok, orchestrator_pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
@@ -689,6 +707,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert render(view) =~ "Human actions"
     assert render(view) =~ "Readable"
     assert render(view) =~ "Raw"
+    assert render(view) =~ "Run Record"
+    assert render(view) =~ "continuation"
+    assert render(view) =~ "Todo -&gt; In Progress"
     assert render(view) =~ "Status Changed"
     assert render(view) =~ "thread/status/changed"
 

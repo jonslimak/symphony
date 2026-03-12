@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Orchestrator, RunRecordStore, StatusDashboard}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -73,6 +73,7 @@ defmodule SymphonyElixirWeb.Presenter do
         {:ok,
          %{
            event_stream_id: event_stream_id,
+           run_record: run_record_payload(event_stream_id),
            events: Enum.map(events, &session_event_payload/1)
          }}
 
@@ -228,6 +229,15 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp session_event_payload(_event), do: %{}
+
+  defp run_record_payload(event_stream_id) when is_binary(event_stream_id) do
+    case RunRecordStore.read(event_stream_id) do
+      {:ok, %{} = record} -> record
+      _ -> nil
+    end
+  end
+
+  defp run_record_payload(_event_stream_id), do: nil
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()
