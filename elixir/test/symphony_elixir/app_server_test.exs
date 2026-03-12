@@ -928,13 +928,28 @@ defmodule SymphonyElixir.AppServerTest do
         }
       end
 
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
       assert {:ok, _result} =
-               AppServer.run(workspace, "Handle supported tool calls", issue, tool_executor: tool_executor)
+               AppServer.run(workspace, "Handle supported tool calls", issue,
+                 on_message: on_message,
+                 tool_executor: tool_executor
+               )
 
       assert_received {:tool_called, "linear_graphql",
                        %{
                          "query" => "query Viewer { viewer { id } }",
                          "variables" => %{"includeTeams" => false}
+                       }}
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :tool_call_completed,
+                         payload: %{"params" => %{"name" => "linear_graphql"}},
+                         result: %{
+                           "success" => true,
+                           "output" => ~s({"data":{"viewer":{"id":"usr_123"}}})
+                         }
                        }}
 
       trace = File.read!(trace_file)
@@ -1060,7 +1075,15 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert_received {:tool_called, "linear_graphql", %{"query" => "query Viewer { viewer { id } }"}}
 
-      assert_received {:app_server_message, %{event: :tool_call_failed, payload: %{"params" => %{"tool" => "linear_graphql"}}}}
+      assert_received {:app_server_message,
+                       %{
+                         event: :tool_call_failed,
+                         payload: %{"params" => %{"tool" => "linear_graphql"}},
+                         result: %{
+                           "success" => false,
+                           "output" => ~s({"error":{"message":"boom"}})
+                         }
+                       }}
     after
       File.rm_rf(test_root)
     end
