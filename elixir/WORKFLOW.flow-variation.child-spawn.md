@@ -28,9 +28,9 @@ agent:
 codex:
   command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
   approval_policy: never
-  thread_sandbox: workspace-write
+  thread_sandbox: danger-full-access
   turn_sandbox_policy:
-    type: workspaceWrite
+    type: dangerFullAccess
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
@@ -63,6 +63,8 @@ No description provided.
 - This workflow is for explicit child-spawn orchestration, not autonomous task invention.
 - Parent tickets may use explicit `Job 1:` and `Job 2:` sections in the issue description.
 - When the issue is `In Progress`, perform only parent-stage execution:
+  - immediately create or switch to the ticket branch before publication checks
+  - prioritize creating the required `deliverables/` artifact before PR discovery or publication checks
   - complete `Job 1`
   - do not perform `Job 2`
   - if `Job 2` work is requested, leave it for `Agent Review`
@@ -72,6 +74,7 @@ No description provided.
   - decide whether to create exactly one child ticket or not spawn
 - Do not invent downstream work when `Job 2` is absent, vague, or would require multiple downstream tasks.
 - Child input must come through explicit issue, PR, or branch/resource reference, not shared parent workspace state.
+- Ignore unrelated existing repo-root files when executing the parent task; create the required `deliverables/` path if it is missing.
 - If a child is created, it must be an ordinary Linear ticket, not a special runtime object.
 - If a child is created, the child ticket must include:
   - parent identifier
@@ -134,8 +137,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
-   - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
-   - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
+   - If the current checkout is already on a non-default ticket branch, check whether that branch PR exists and whether it is closed.
+   - If a non-default branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
+   - If the current checkout is still on the default branch, do not spend time on PR discovery yet; create the fresh ticket branch first and continue with parent execution.
 5. For `Todo` tickets, do startup sequencing in this exact order:
    - update issue state to `In Progress`
    - find or create `## Codex Workpad`
@@ -154,21 +158,23 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 6. Add explicit acceptance criteria and TODOs in checklist form in the same comment.
 7. Run a principal-style self-review of the plan and refine it in the comment.
 8. Before implementing, capture a concrete reproduction signal and record it in the workpad `Notes` section.
-9. Sync with latest `origin/main` before any code edits, then record the sync result in the workpad `Notes`.
+9. Sync with latest `origin/main` before publication and before any push attempt, then record the sync result in the workpad `Notes`.
 
 ## Step 2: Execution phase (Todo -> In Progress -> Agent Review)
 
-1. Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff sync result is already recorded in the workpad.
+1. Determine current repo state (`branch`, `git status`, `HEAD`) and, if still on the default branch, create or switch to the ticket branch immediately.
 2. If current issue state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
 3. Load the existing workpad comment and treat it as the active execution checklist.
 4. Implement against the hierarchical TODOs and keep the comment current.
    - In `In Progress`, perform only parent `Job 1` work; do not perform `Job 2`.
+   - Create the required `deliverables/` path if it is missing.
+   - Do not block parent `Job 1` on PR discovery or publication checks before the first artifact exists.
    - Check off completed items.
    - Add newly discovered items in the appropriate section.
    - Keep parent and child structure intact as scope evolves.
 5. Run validation or tests required for the scope.
 6. Re-check all acceptance criteria and close any gaps.
-7. Before every `git push` attempt, run the required validation for your scope and confirm it passes.
+7. Before every `git push` attempt, sync with latest `origin/main`, run the required validation for your scope, and confirm it passes.
 8. Attach the PR URL to the issue.
 9. Merge latest `origin/main` into the branch, resolve conflicts, and rerun checks.
 10. Update the workpad comment with final checklist status and validation notes.
@@ -193,6 +199,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - Record the refusal reason in the workpad.
    - Move the parent to `Human Review` unless the issue clearly requires `Rework`.
 6. If `Job 2` is explicit and the handoff contract is valid, create exactly one child ticket using `linear_graphql`.
+   - Resolve the parent project first and set the same project on `issueCreate` (project `sym`, slugId `3471de2055a9`).
    - The child ticket must include:
      - parent identifier
      - child goal derived from `Job 2`
@@ -201,6 +208,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
      - child acceptance criteria
      - explicit statement that the child must use the named artifact as input
    - Create the child in `Todo`.
+   - Immediately verify the created child has `project.slugId == 3471de2055a9`; if not, treat spawn as incomplete and correct it before finishing review.
 7. Record the child identifier and handoff source in the parent workpad.
 8. After the child is created, move the parent to `Human Review`.
 
