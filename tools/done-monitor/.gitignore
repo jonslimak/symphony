@@ -1,4 +1,6 @@
 processed.json
 monitor.lock
 monitor.log
+control.json
 .processed_*.tmp
+*.swp

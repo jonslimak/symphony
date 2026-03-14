@@ -6,6 +6,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.DoneMonitorControl
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.Tracker
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter, SessionActivityFormatter}
@@ -39,6 +40,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:ticket_status_drafts, %{})
       |> assign(:ticket_comment_drafts, %{})
       |> assign(:ticket_status_options, ticket_status_options())
+      |> assign(:done_monitor, load_done_monitor_state())
       |> refresh_project_tickets()
 
     if connected?(socket) do
@@ -52,7 +54,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
   @impl true
   def handle_info(:runtime_tick, socket) do
     schedule_runtime_tick()
-    {:noreply, assign(socket, :now, DateTime.utc_now())}
+    {:noreply,
+     socket
+     |> assign(:now, DateTime.utc_now())
+     |> assign(:done_monitor, load_done_monitor_state())}
   end
 
   @impl true
@@ -63,6 +68,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
      socket
      |> assign(:payload, payload)
      |> assign(:now, DateTime.utc_now())
+     |> assign(:done_monitor, load_done_monitor_state())
      |> maybe_refresh_activity_drawer()
      |> refresh_project_tickets()}
   end
@@ -225,6 +231,66 @@ defmodule SymphonyElixirWeb.DashboardLive do
   def handle_event("submit_ticket_comment", _params, socket), do: {:noreply, socket}
 
   @impl true
+  def handle_event("done_monitor_toggle", %{"enabled" => enabled_value}, socket) do
+    enabled = enabled_value in ["true", true, "1", 1]
+
+    case DoneMonitorControl.set_enabled(enabled, "new_only") do
+      {:ok, _state} ->
+        message =
+          if enabled do
+            "Done monitor enabled (new Done only)."
+          else
+            "Done monitor disabled."
+          end
+
+        {:noreply,
+         socket
+         |> assign(:done_monitor, load_done_monitor_state())
+         |> put_flash(:info, message)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Done monitor toggle failed: #{inspect(reason)}")}
+    end
+  end
+
+  @impl true
+  def handle_event("done_monitor_set_interval", %{"seconds" => seconds_value}, socket) do
+    interval =
+      case Integer.parse(to_string(seconds_value)) do
+        {parsed, _rest} -> parsed
+        _ -> 0
+      end
+
+    case DoneMonitorControl.set_interval(interval) do
+      {:ok, _state} ->
+        {:noreply,
+         socket
+         |> assign(:done_monitor, load_done_monitor_state())
+         |> put_flash(:info, "Done monitor interval set to #{interval} seconds.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Failed to set interval: #{inspect(reason)}")}
+    end
+  end
+
+  @impl true
+  def handle_event("done_monitor_run_once", _params, socket) do
+    case DoneMonitorControl.run_once(1) do
+      {:ok, _state} ->
+        {:noreply,
+         socket
+         |> assign(:done_monitor, load_done_monitor_state())
+         |> put_flash(:info, "Done monitor run queued (max 1 item).")}
+
+      {:error, :already_running} ->
+        {:noreply, put_flash(socket, :error, "Done monitor is already running.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Done monitor run failed: #{inspect(reason)}")}
+    end
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -272,6 +338,54 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </span>
             </span>
           </p>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Done monitor</h2>
+            </div>
+          </div>
+          <p class="muted">
+            Mode: <span class="mono"><%= @done_monitor.mode || "new_only" %></span> ·
+            Interval: <span class="mono"><%= @done_monitor.interval_seconds || 300 %>s</span> ·
+            Last run: <span class="mono"><%= @done_monitor.last_run_at || "n/a" %></span>
+          </p>
+          <p :if={@done_monitor.last_error} class="empty-state">Last error: <%= @done_monitor.last_error %></p>
+          <div class="session-stack" style="margin-top: 0.6rem;">
+            <span class={if @done_monitor.enabled, do: "state-badge state-badge-active", else: "state-badge state-badge-warning"}>
+              <%= if @done_monitor.enabled, do: "On", else: "Off" %>
+            </span>
+            <button
+              :if={!@done_monitor.enabled}
+              type="button"
+              phx-click="done_monitor_toggle"
+              phx-value-enabled="true"
+            >
+              Turn On
+            </button>
+            <button
+              :if={@done_monitor.enabled}
+              type="button"
+              class="secondary"
+              phx-click="done_monitor_toggle"
+              phx-value-enabled="false"
+            >
+              Turn Off
+            </button>
+            <button type="button" class="secondary" phx-click="done_monitor_run_once">Run Once</button>
+          </div>
+          <div class="session-stack" style="margin-top: 0.6rem;">
+            <button type="button" class="secondary" phx-click="done_monitor_set_interval" phx-value-seconds="60">
+              1m
+            </button>
+            <button type="button" class="secondary" phx-click="done_monitor_set_interval" phx-value-seconds="300">
+              5m
+            </button>
+            <button type="button" class="secondary" phx-click="done_monitor_set_interval" phx-value-seconds="900">
+              15m
+            </button>
+          </div>
         </section>
 
         <section class="section-card section-running">
@@ -918,6 +1032,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp load_payload do
     Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
+  end
+
+  defp load_done_monitor_state do
+    case DoneMonitorControl.snapshot() do
+      {:ok, state} when is_map(state) ->
+        state
+
+      _ ->
+        %{
+          enabled: false,
+          interval_seconds: 300,
+          mode: "new_only",
+          enabled_at: nil,
+          last_run_at: nil,
+          last_status: "unavailable",
+          last_error: "monitor_unavailable",
+          running: false
+        }
+    end
   end
 
   defp orchestrator do

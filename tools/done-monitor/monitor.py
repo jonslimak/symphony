@@ -11,6 +11,7 @@ State is tracked in processed.json (auto-created).
 
 from __future__ import annotations
 
+import argparse
 import atexit
 import json
 import logging
@@ -147,6 +148,8 @@ query DoneMonitorPoll($projectSlug: String!, $stateName: [String!]!, $first: Int
       labels { nodes { id name } }
       project { id }
       team { id }
+      completedAt
+      updatedAt
     }
     pageInfo {
       hasNextPage
@@ -219,6 +222,60 @@ def fetch_done_issues() -> list[dict]:
 
     log.info("Fetched %d Done issues from Linear", len(all_issues))
     return all_issues
+
+
+def parse_issue_datetime(issue: dict) -> datetime | None:
+    for key in ("completedAt", "updatedAt"):
+        raw_value = issue.get(key)
+        if not raw_value or not isinstance(raw_value, str):
+            continue
+        normalized = raw_value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_enabled_at(raw_value: str | None) -> datetime | None:
+    if not raw_value or not isinstance(raw_value, str):
+        return None
+    normalized = raw_value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def filter_eligible_issues(
+    issues: list[dict],
+    processed: dict,
+    mode: str,
+    enabled_at: datetime | None,
+) -> list[dict]:
+    unprocessed = [issue for issue in issues if issue.get("id") not in processed]
+    if mode != "new_only":
+        return unprocessed
+    if enabled_at is None:
+        return unprocessed
+    filtered: list[dict] = []
+    for issue in unprocessed:
+        completed_at = parse_issue_datetime(issue)
+        if completed_at is None:
+            continue
+        if completed_at >= enabled_at:
+            filtered.append(issue)
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -374,13 +431,18 @@ def create_followup(parent: dict, evaluation: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def main():
+def run_once(
+    mode: str = "backfill",
+    enabled_at: str | None = None,
+    max_items: int | None = None,
+    emit_summary_json: bool = False,
+) -> int:
     if not LINEAR_API_KEY:
         log.error("LINEAR_API_KEY not set")
-        sys.exit(1)
+        return 1
     if not ANTHROPIC_API_KEY:
         log.error("ANTHROPIC_API_KEY not set")
-        sys.exit(1)
+        return 1
 
     acquire_lock()
 
@@ -391,16 +453,34 @@ def main():
         issues = fetch_done_issues()
     except Exception as exc:
         log.error("Failed to fetch Done issues: %s", exc)
-        sys.exit(1)
+        return 1
 
-    unprocessed = [i for i in issues if i["id"] not in processed]
-    if not unprocessed:
-        log.info("No new Done issues to process")
-        return
+    enabled_at_dt = parse_enabled_at(enabled_at)
+    eligible = filter_eligible_issues(issues, processed, mode, enabled_at_dt)
+    if max_items is not None and max_items > 0:
+        eligible = eligible[:max_items]
+    if not eligible:
+        log.info("No eligible Done issues to process (mode=%s)", mode)
+        if emit_summary_json:
+            print(
+                json.dumps(
+                    {
+                        "mode": mode,
+                        "fetched_done": len(issues),
+                        "already_processed": len(processed),
+                        "eligible": 0,
+                        "processed_count": 0,
+                        "status": "ok",
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        return 0
 
-    log.info("Processing %d new Done issues", len(unprocessed))
+    log.info("Processing %d eligible Done issues (mode=%s)", len(eligible), mode)
+    processed_count = 0
 
-    for issue in unprocessed:
+    for issue in eligible:
         issue_id = issue["id"]
         identifier = issue.get("identifier", "?")
 
@@ -430,8 +510,63 @@ def main():
         # Save after each issue for crash resilience
         save_processed(processed)
         log.info("Marked %s as processed (action=%s)", identifier, processed[issue_id]["action"])
+        processed_count += 1
 
-    log.info("Done. Processed %d issues this run.", len(unprocessed))
+    log.info("Done. Processed %d issues this run.", processed_count)
+    if emit_summary_json:
+        print(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "fetched_done": len(issues),
+                    "already_processed": len(processed) - processed_count,
+                    "eligible": len(eligible),
+                    "processed_count": processed_count,
+                    "status": "ok",
+                },
+                separators=(",", ":"),
+            )
+        )
+    return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Done-monitor runner")
+    parser.add_argument(
+        "--mode",
+        choices=["backfill", "new_only"],
+        default="backfill",
+        help="Issue selection mode",
+    )
+    parser.add_argument(
+        "--enabled-at",
+        default=None,
+        help="ISO timestamp gate for new_only mode (issues completed before this are skipped)",
+    )
+    parser.add_argument(
+        "--max-items",
+        type=int,
+        default=None,
+        help="Max eligible issues to process in this run",
+    )
+    parser.add_argument(
+        "--summary-json",
+        action="store_true",
+        help="Emit a compact JSON summary at end of run",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
+    exit_code = run_once(
+        mode=args.mode,
+        enabled_at=args.enabled_at,
+        max_items=args.max_items,
+        emit_summary_json=args.summary_json,
+    )
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

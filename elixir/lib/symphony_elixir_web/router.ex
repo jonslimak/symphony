@@ -30,11 +30,19 @@ defmodule SymphonyElixirWeb.Router do
 
   scope "/", SymphonyElixirWeb do
     get("/api/v1/state", ObservabilityApiController, :state)
+    get("/api/v1/done-monitor/state", DoneMonitorApiController, :state)
+    post("/api/v1/done-monitor/toggle", DoneMonitorApiController, :toggle)
+    post("/api/v1/done-monitor/interval", DoneMonitorApiController, :interval)
+    post("/api/v1/done-monitor/run_once", DoneMonitorApiController, :run_once)
     get("/api/v1/session/:event_stream_id/events", ObservabilityApiController, :session_events)
     get("/api/v1/debug/running/:issue_identifier", ObservabilityApiController, :debug_running_issue)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)
+    match(:*, "/api/v1/done-monitor/state", DoneMonitorApiController, :method_not_allowed)
+    match(:*, "/api/v1/done-monitor/toggle", DoneMonitorApiController, :method_not_allowed)
+    match(:*, "/api/v1/done-monitor/interval", DoneMonitorApiController, :method_not_allowed)
+    match(:*, "/api/v1/done-monitor/run_once", DoneMonitorApiController, :method_not_allowed)
     match(:*, "/api/v1/session/:event_stream_id/events", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/debug/running/:issue_identifier", ObservabilityApiController, :method_not_allowed)
     post("/api/v1/refresh", ObservabilityApiController, :refresh)
