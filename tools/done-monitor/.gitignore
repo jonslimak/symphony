@@ -1,0 +1,4 @@
+processed.json
+monitor.lock
+monitor.log
+.processed_*.tmp
